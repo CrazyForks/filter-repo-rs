@@ -1,6 +1,99 @@
 mod common;
 use common::fake_secrets;
 use common::*;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Child, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
+    let start = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .expect("poll detect-secrets child process")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("collect detect-secrets child output");
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out detect-secrets output");
+            panic!(
+                "detect-secrets timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+                timeout,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn import_many_plain_text_blobs(repo: &Path, count: usize) {
+    let branch = current_branch(repo);
+    let (code, parent, stderr) = run_git(repo, &["rev-parse", "HEAD"]);
+    assert_eq!(code, 0, "git rev-parse HEAD failed: {stderr}");
+    let parent = parent.trim();
+    let mut stream = Vec::new();
+    for idx in 0..count {
+        let contents = format!("plain historical text object {idx:05}\n");
+        writeln!(&mut stream, "blob").expect("write fast-import blob command");
+        writeln!(&mut stream, "mark :{}", idx + 1).expect("write fast-import mark");
+        writeln!(&mut stream, "data {}", contents.len()).expect("write fast-import data size");
+        stream.extend_from_slice(contents.as_bytes());
+    }
+
+    let message = "add many plain text blobs\n";
+    writeln!(&mut stream, "commit refs/heads/{branch}").expect("write fast-import commit");
+    writeln!(
+        &mut stream,
+        "committer A U Thor <a.u.thor@example.com> 0 +0000"
+    )
+    .expect("write fast-import committer");
+    writeln!(&mut stream, "data {}", message.len()).expect("write fast-import message size");
+    stream.extend_from_slice(message.as_bytes());
+    writeln!(&mut stream, "from {parent}").expect("write fast-import parent");
+    for idx in 0..count {
+        writeln!(&mut stream, "M 100644 :{} objects/{idx:05}.txt", idx + 1)
+            .expect("write fast-import filemodify");
+    }
+
+    let mut child = std::process::Command::new("git")
+        .current_dir(repo)
+        .arg("fast-import")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git fast-import");
+    let write_result = child
+        .stdin
+        .take()
+        .expect("open git fast-import stdin")
+        .write_all(&stream);
+    let output = child.wait_with_output().expect("run git fast-import");
+    assert!(
+        write_result.is_ok(),
+        "write git fast-import stream failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        write_result.err(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "git fast-import failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 #[test]
 fn detect_secrets_dry_run_writes_draft_file() {
@@ -59,6 +152,37 @@ fn detect_secrets_reports_zero_when_no_matches() {
     assert!(
         output.status.success(),
         "detect-secrets on clean repo should succeed"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0 potential secrets"),
+        "expected zero summary in stdout: {}",
+        stdout
+    );
+}
+
+#[test]
+fn detect_secrets_handles_many_reachable_objects_without_cat_file_pipe_deadlock() {
+    let repo = init_repo();
+
+    import_many_plain_text_blobs(&repo, 5000);
+
+    let child = cli_command()
+        .arg("--detect-secrets")
+        .arg("--dry-run")
+        .current_dir(&repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn detect-secrets mode");
+    let output = wait_with_timeout(child, Duration::from_secs(15));
+
+    assert!(
+        output.status.success(),
+        "detect-secrets should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);

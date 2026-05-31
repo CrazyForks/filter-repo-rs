@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
+use std::thread;
 
 use rayon::prelude::*;
 use regex::bytes::Regex;
@@ -282,16 +283,11 @@ fn collect_blob_candidates(repo: &Path) -> io::Result<Vec<BlobCandidate>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("failed to open git cat-file stdin"))?;
-        for oid in &object_lines {
-            stdin.write_all(oid.as_bytes())?;
-            stdin.write_all(b"\n")?;
-        }
-    }
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("failed to open git cat-file stdin"))?;
+    let writer = spawn_oid_writer(stdin, object_lines);
 
     let stdout = child
         .stdout
@@ -318,6 +314,7 @@ fn collect_blob_candidates(repo: &Path) -> io::Result<Vec<BlobCandidate>> {
     }
 
     let status = child.wait()?;
+    join_oid_writer(writer, "git cat-file --batch-check")?;
     if !status.success() {
         return Err(io::Error::other(
             "git cat-file --batch-check failed while collecting blob metadata",
@@ -345,16 +342,15 @@ fn scan_blob_candidates(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("failed to open git cat-file stdin"))?;
-        for candidate in candidates {
-            stdin.write_all(candidate.oid.as_bytes())?;
-            stdin.write_all(b"\n")?;
-        }
-    }
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("failed to open git cat-file stdin"))?;
+    let candidate_oids: Vec<String> = candidates
+        .iter()
+        .map(|candidate| candidate.oid.clone())
+        .collect();
+    let writer = spawn_oid_writer(stdin, candidate_oids);
 
     let stdout = child
         .stdout
@@ -396,6 +392,7 @@ fn scan_blob_candidates(
     }
 
     let status = child.wait()?;
+    join_oid_writer(writer, "git cat-file --batch")?;
     if !status.success() {
         return Err(io::Error::other(
             "git cat-file --batch failed while scanning blobs",
@@ -419,6 +416,28 @@ fn scan_blob_candidates(
 
     unique_detections.sort_by(|a, b| a.value.cmp(&b.value));
     Ok(unique_detections)
+}
+
+fn spawn_oid_writer(
+    mut stdin: ChildStdin,
+    oids: Vec<String>,
+) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        for oid in oids {
+            stdin.write_all(oid.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+        Ok(())
+    })
+}
+
+fn join_oid_writer(
+    writer: thread::JoinHandle<io::Result<()>>,
+    command_name: &str,
+) -> io::Result<()> {
+    writer
+        .join()
+        .map_err(|_| io::Error::other(format!("{command_name} writer thread panicked")))?
 }
 
 pub fn collect_blob_detections(
