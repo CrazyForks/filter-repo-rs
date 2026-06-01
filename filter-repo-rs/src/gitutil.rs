@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 
 use colored::*;
 
@@ -28,6 +29,8 @@ pub fn run_git_with_timeout(
     let mut child = cmd
         .spawn()
         .map_err(|e| io::Error::other(format!("failed to spawn git command: {e}")))?;
+    let mut stdout_reader = child.stdout.take().map(spawn_reader);
+    let mut stderr_reader = child.stderr.take().map(spawn_reader);
 
     let start_time = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -35,16 +38,8 @@ pub fn run_git_with_timeout(
     loop {
         match child.try_wait()? {
             Some(status) => {
-                let stdout = child.stdout.take().map_or_else(Vec::new, |mut s| {
-                    let mut buf = Vec::new();
-                    let _ = s.read_to_end(&mut buf);
-                    buf
-                });
-                let stderr = child.stderr.take().map_or_else(Vec::new, |mut s| {
-                    let mut buf = Vec::new();
-                    let _ = s.read_to_end(&mut buf);
-                    buf
-                });
+                let stdout = join_optional_reader(stdout_reader.take(), "stdout")?;
+                let stderr = join_optional_reader(stderr_reader.take(), "stderr")?;
                 return Ok(std::process::Output {
                     status,
                     stdout,
@@ -55,6 +50,8 @@ pub fn run_git_with_timeout(
                 if start_time.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_optional_reader(stdout_reader.take(), "stdout");
+                    let _ = join_optional_reader(stderr_reader.take(), "stderr");
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
@@ -74,6 +71,63 @@ pub fn run_git_with_timeout(
                 std::thread::sleep(Duration::from_millis(sleep_ms));
             }
         }
+    }
+}
+
+/// Spawn a background thread that drains a child stream to completion.
+///
+/// Reading child stdout/stderr from a dedicated thread prevents pipe
+/// backpressure deadlocks while the parent keeps writing to or waiting on the
+/// child process.
+pub(crate) fn spawn_reader<R>(mut reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+/// Join a reader thread spawned by [`spawn_reader`], propagating IO errors and
+/// converting a panicked thread into an IO error.
+pub(crate) fn join_reader(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other(format!("{stream_name} reader thread panicked")))?
+}
+
+/// Join an optional reader thread, returning an empty buffer when the stream
+/// was never piped.
+pub(crate) fn join_optional_reader(
+    reader: Option<thread::JoinHandle<io::Result<Vec<u8>>>>,
+    stream_name: &str,
+) -> io::Result<Vec<u8>> {
+    match reader {
+        Some(handle) => join_reader(handle, stream_name),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Render captured child stderr bytes into a bounded, human-readable summary
+/// for error messages.
+pub(crate) fn format_child_stderr(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "no stderr output".to_string();
+    }
+    const MAX_STDERR_CHARS: usize = 4096;
+    let mut chars = trimmed.chars();
+    let summary: String = chars.by_ref().take(MAX_STDERR_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{summary}...")
+    } else {
+        summary
     }
 }
 
@@ -703,6 +757,29 @@ mod tests {
 
         // Should be empty for normal repo
         assert!(replace_refs.is_empty());
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_git_with_timeout_drains_stdout_while_child_is_running() -> io::Result<()> {
+        let output = run_git_with_timeout(
+            None,
+            &[
+                "-c",
+                "alias.emit-large=!sh -c 'i=0; while [ \"$i\" -lt 80000 ]; do printf \"0123456789abcdef\\n\"; i=$((i + 1)); done'",
+                "emit-large",
+            ],
+            5,
+        )?;
+
+        assert!(output.status.success(), "large-output alias should succeed");
+        assert!(
+            output.stdout.len() > 1024 * 1024,
+            "expected large stdout capture, got {} bytes",
+            output.stdout.len()
+        );
 
         Ok(())
     }

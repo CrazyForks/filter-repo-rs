@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commit::{AuthorRewriter, MailmapRewriter};
 use crate::error::Result as FilterRepoResult;
-use crate::gitutil::git_dir;
+use crate::gitutil::{format_child_stderr, git_dir, join_reader, spawn_reader};
 use crate::limits::parse_data_size_header;
 use crate::message::blob_regex::RegexReplacer as BlobRegexReplacer;
 use crate::message::msg_regex::RegexReplacer as MsgRegexReplacer;
@@ -1072,6 +1072,11 @@ impl BlobSizeTracker {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("missing stdout from git cat-file batch"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("missing stderr from git cat-file batch"))?;
+        let stderr_reader = spawn_reader(stderr);
         let mut reader = BufReader::new(stdout);
         let mut line = Vec::with_capacity(128);
         loop {
@@ -1112,15 +1117,12 @@ impl BlobSizeTracker {
                 self.oversize.insert(sha.to_vec());
             }
         }
-        let mut stderr_buf = Vec::new();
-        if let Some(mut err) = child.stderr.take() {
-            err.read_to_end(&mut stderr_buf)?;
-        }
         let status = child.wait()?;
+        let stderr_buf = join_reader(stderr_reader, "git cat-file batch stderr")?;
         if !status.success() {
-            let msg = String::from_utf8_lossy(&stderr_buf);
             return Err(io::Error::other(format!(
-                "git cat-file batch failed: {msg}"
+                "git cat-file batch failed: {}",
+                format_child_stderr(&stderr_buf)
             )));
         }
         self.prefetch_ok = true;

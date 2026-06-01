@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -644,29 +644,18 @@ impl GitCommandExecutor {
         mut cmd: Command,
         timeout: Duration,
     ) -> Result<std::process::Output, io::Error> {
-        use std::process::Stdio;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn()?;
+        let mut stdout_reader = child.stdout.take().map(crate::gitutil::spawn_reader);
+        let mut stderr_reader = child.stderr.take().map(crate::gitutil::spawn_reader);
         let start_time = Instant::now();
         loop {
             match child.try_wait()? {
                 Some(status) => {
-                    let stdout = {
-                        let mut buf = Vec::new();
-                        if let Some(mut stdout) = child.stdout.take() {
-                            use std::io::Read;
-                            stdout.read_to_end(&mut buf)?;
-                        }
-                        buf
-                    };
-                    let stderr = {
-                        let mut buf = Vec::new();
-                        if let Some(mut stderr) = child.stderr.take() {
-                            use std::io::Read;
-                            stderr.read_to_end(&mut buf)?;
-                        }
-                        buf
-                    };
+                    let stdout =
+                        crate::gitutil::join_optional_reader(stdout_reader.take(), "stdout")?;
+                    let stderr =
+                        crate::gitutil::join_optional_reader(stderr_reader.take(), "stderr")?;
                     return Ok(std::process::Output {
                         status,
                         stdout,
@@ -677,11 +666,44 @@ impl GitCommandExecutor {
                     if start_time.elapsed() >= timeout {
                         let _ = child.kill();
                         let _ = child.wait();
+                        let _ =
+                            crate::gitutil::join_optional_reader(stdout_reader.take(), "stdout");
+                        let _ =
+                            crate::gitutil::join_optional_reader(stderr_reader.take(), "stderr");
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "Command timed out"));
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitCommandExecutor;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_with_timeout_drains_stdout_while_child_is_running() {
+        let executor = GitCommandExecutor::new(Path::new("."));
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(
+            "i=0; while [ \"$i\" -lt 80000 ]; do printf '0123456789abcdef\\n'; i=$((i + 1)); done",
+        );
+
+        let output = executor
+            .execute_with_timeout(cmd, Duration::from_secs(10))
+            .expect("large stdout command should finish without pipe backpressure timeout");
+
+        assert!(output.status.success(), "child command should succeed");
+        assert!(
+            output.stdout.len() > 1024 * 1024,
+            "expected large stdout capture, got {} bytes",
+            output.stdout.len()
+        );
     }
 }

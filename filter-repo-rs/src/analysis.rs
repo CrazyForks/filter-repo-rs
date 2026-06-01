@@ -416,13 +416,12 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
 
     let mut line_buf = String::new();
     while reader.read_line(&mut line_buf)? > 0 {
-        let line = line_buf.trim_end();
-        let mut parts = line.splitn(2, ' ');
-        if let (Some(oid), Some(path)) = (parts.next(), parts.next()) {
-            if blob_oids.contains(oid) && !path.is_empty() {
-                blob_path_map.insert(oid.to_string(), path.to_string());
-                if blob_path_map.len() >= blob_oids.len() {
-                    break;
+        if blob_path_map.len() < blob_oids.len() {
+            let line = line_buf.trim_end();
+            let mut parts = line.splitn(2, ' ');
+            if let (Some(oid), Some(path)) = (parts.next(), parts.next()) {
+                if blob_oids.contains(oid) && !path.is_empty() {
+                    blob_path_map.insert(oid.to_string(), path.to_string());
                 }
             }
         }

@@ -1,5 +1,97 @@
 mod common;
 use common::*;
+use std::path::Path;
+use std::process::{Child, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
+    let start = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .expect("poll filter-repo-rs child process")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("collect filter-repo-rs child output");
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out filter-repo-rs output");
+            panic!(
+                "filter-repo-rs timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+                timeout,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn find_git_on_path() -> String {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("git"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("git should be on PATH")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+fn prepend_path(command: &mut std::process::Command, dir: &Path) {
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(std::env::split_paths(&current_path));
+    command.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+}
+
+#[cfg(unix)]
+fn write_batch_all_objects_stderr_flood_git(repo: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = repo.join("fake-git-bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake git dir");
+    let git_path = bin_dir.join("git");
+    let script = r#"#!/bin/sh
+saw_cat_file=0
+saw_batch_all=0
+for arg in "$@"; do
+  if [ "$arg" = "cat-file" ]; then
+    saw_cat_file=1
+  fi
+  if [ "$arg" = "--batch-all-objects" ]; then
+    saw_batch_all=1
+  fi
+done
+if [ "$saw_cat_file" = "1" ] && [ "$saw_batch_all" = "1" ]; then
+  i=0
+  while [ "$i" -lt 5000 ]; do
+    printf 'batch-all stderr flood %05d 0123456789abcdef0123456789abcdef\n' "$i" >&2
+    i=$((i + 1))
+  done
+  exit 1
+fi
+exec "$FRRS_REAL_GIT" "$@"
+"#;
+    std::fs::write(&git_path, script).expect("write fake git");
+    let mut perms = std::fs::metadata(&git_path)
+        .expect("fake git metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&git_path, perms).expect("make fake git executable");
+    bin_dir
+}
 
 #[test]
 fn max_blob_size_edge_cases() {
@@ -125,6 +217,38 @@ fn max_blob_size_batch_optimization_verification() {
     }
     assert!(!tree.contains("large1.bin"));
     assert!(!tree.contains("large2.bin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn max_blob_size_prefetch_drains_cat_file_stderr_before_fallback() {
+    let repo = init_repo();
+    write_file(&repo, "small.txt", "small content\n");
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "add small file"]);
+
+    let fake_git_dir = write_batch_all_objects_stderr_flood_git(&repo);
+    let mut command = cli_command();
+    command
+        .arg("--max-blob-size")
+        .arg("1024")
+        .arg("--dry-run")
+        .arg("--force")
+        .current_dir(&repo)
+        .env("FRRS_REAL_GIT", find_git_on_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepend_path(&mut command, &fake_git_dir);
+
+    let child = command.spawn().expect("spawn filter-repo-rs");
+    let output = wait_with_timeout(child, Duration::from_secs(10));
+
+    assert!(
+        output.status.success(),
+        "prefetch failure should fall back without hanging\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

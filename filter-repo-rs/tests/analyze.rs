@@ -2,6 +2,107 @@ use filter_repo_rs as fr;
 
 mod common;
 use common::*;
+use std::path::Path;
+use std::process::{Child, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
+    let start = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .expect("poll analyze child process")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("collect analyze child output");
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out analyze output");
+            panic!(
+                "analyze timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+                timeout,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn find_git_on_path() -> String {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("git"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("git should be on PATH")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+fn prepend_path(command: &mut std::process::Command, dir: &Path) {
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(std::env::split_paths(&current_path));
+    command.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+}
+
+#[cfg(unix)]
+fn write_rev_list_stdout_flood_git(repo: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = repo.join("fake-git-bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake git dir");
+    let git_path = bin_dir.join("git");
+    let script = r#"#!/bin/sh
+saw_rev_list=0
+saw_objects=0
+saw_all=0
+for arg in "$@"; do
+  if [ "$arg" = "rev-list" ]; then
+    saw_rev_list=1
+  fi
+  if [ "$arg" = "--objects" ]; then
+    saw_objects=1
+  fi
+  if [ "$arg" = "--all" ]; then
+    saw_all=1
+  fi
+done
+if [ "$saw_rev_list" = "1" ] && [ "$saw_objects" = "1" ] && [ "$saw_all" = "1" ]; then
+  "$FRRS_REAL_GIT" "$@"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    exit "$status"
+  fi
+  i=0
+  while [ "$i" -lt 5000 ]; do
+    printf '000000000000000000000000000000000000%04d extra/%05d.txt\n' "$i" "$i"
+    i=$((i + 1))
+  done
+  exit 0
+fi
+exec "$FRRS_REAL_GIT" "$@"
+"#;
+    std::fs::write(&git_path, script).expect("write fake git");
+    let mut perms = std::fs::metadata(&git_path)
+        .expect("fake git metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&git_path, perms).expect("make fake git executable");
+    bin_dir
+}
 
 #[test]
 fn analyze_mode_produces_human_report() {
@@ -221,6 +322,41 @@ fn analyze_json_stdout_is_valid_json_without_progress_prefix() {
         "warnings missing from json: {}",
         stdout
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_drains_rev_list_stdout_after_blob_paths_are_known() {
+    let repo = init_repo();
+    write_file(&repo, "src/a.txt", "a\n");
+    assert_eq!(run_git(&repo, &["add", "."]).0, 0);
+    assert_eq!(run_git(&repo, &["commit", "-m", "seed analyze drain"]).0, 0);
+
+    let fake_git_dir = write_rev_list_stdout_flood_git(&repo);
+    let mut command = cli_command();
+    command
+        .arg("--analyze")
+        .arg("--analyze-json")
+        .arg("--source")
+        .arg(repo.to_string_lossy().as_ref())
+        .arg("--target")
+        .arg(repo.to_string_lossy().as_ref())
+        .env("FRRS_REAL_GIT", find_git_on_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepend_path(&mut command, &fake_git_dir);
+
+    let child = command.spawn().expect("spawn analyze mode");
+    let output = wait_with_timeout(child, Duration::from_secs(10));
+
+    assert!(
+        output.status.success(),
+        "analyze should drain remaining rev-list stdout\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("stdout should remain valid json");
 }
 
 #[test]

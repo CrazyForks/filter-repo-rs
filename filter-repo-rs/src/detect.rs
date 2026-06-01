@@ -288,6 +288,11 @@ fn collect_blob_candidates(repo: &Path) -> io::Result<Vec<BlobCandidate>> {
         .take()
         .ok_or_else(|| io::Error::other("failed to open git cat-file stdin"))?;
     let writer = spawn_oid_writer(stdin, object_lines);
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("failed to read git cat-file stderr"))?;
+    let stderr_reader = crate::gitutil::spawn_reader(stderr);
 
     let stdout = child
         .stdout
@@ -314,12 +319,15 @@ fn collect_blob_candidates(repo: &Path) -> io::Result<Vec<BlobCandidate>> {
     }
 
     let status = child.wait()?;
-    join_oid_writer(writer, "git cat-file --batch-check")?;
+    let writer_result = join_oid_writer(writer, "git cat-file --batch-check");
+    let stderr = crate::gitutil::join_reader(stderr_reader, "git cat-file --batch-check")?;
     if !status.success() {
-        return Err(io::Error::other(
-            "git cat-file --batch-check failed while collecting blob metadata",
-        ));
+        return Err(io::Error::other(format!(
+            "git cat-file --batch-check failed while collecting blob metadata: {}",
+            crate::gitutil::format_child_stderr(&stderr)
+        )));
     }
+    writer_result?;
 
     Ok(blobs)
 }
@@ -351,6 +359,11 @@ fn scan_blob_candidates(
         .map(|candidate| candidate.oid.clone())
         .collect();
     let writer = spawn_oid_writer(stdin, candidate_oids);
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("failed to read git cat-file stderr"))?;
+    let stderr_reader = crate::gitutil::spawn_reader(stderr);
 
     let stdout = child
         .stdout
@@ -392,12 +405,15 @@ fn scan_blob_candidates(
     }
 
     let status = child.wait()?;
-    join_oid_writer(writer, "git cat-file --batch")?;
+    let writer_result = join_oid_writer(writer, "git cat-file --batch");
+    let stderr = crate::gitutil::join_reader(stderr_reader, "git cat-file --batch")?;
     if !status.success() {
-        return Err(io::Error::other(
-            "git cat-file --batch failed while scanning blobs",
-        ));
+        return Err(io::Error::other(format!(
+            "git cat-file --batch failed while scanning blobs: {}",
+            crate::gitutil::format_child_stderr(&stderr)
+        )));
     }
+    writer_result?;
 
     let detections: Vec<Detection> = blob_payloads
         .into_par_iter()
