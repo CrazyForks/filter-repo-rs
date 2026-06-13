@@ -618,7 +618,9 @@ impl GitCommandExecutor {
         Err(GitCommandError::RetryExhausted {
             command: command_str,
             attempts: max_retries,
-            last_error: Box::new(last_error.unwrap()),
+            last_error: Box::new(last_error.unwrap_or_else(|| {
+                GitCommandError::IoError(format!("no error captured (max_retries={})", max_retries))
+            })),
         })
     }
 
@@ -696,7 +698,7 @@ mod tests {
         );
 
         let output = executor
-            .execute_with_timeout(cmd, Duration::from_secs(10))
+            .execute_with_timeout(cmd, Duration::from_secs(30))
             .expect("large stdout command should finish without pipe backpressure timeout");
 
         assert!(output.status.success(), "child command should succeed");

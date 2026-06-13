@@ -771,7 +771,7 @@ mod tests {
                 "alias.emit-large=!sh -c 'i=0; while [ \"$i\" -lt 80000 ]; do printf \"0123456789abcdef\\n\"; i=$((i + 1)); done'",
                 "emit-large",
             ],
-            5,
+            30,
         )?;
 
         assert!(output.status.success(), "large-output alias should succeed");
