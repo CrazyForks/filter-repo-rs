@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::thread;
 
+use aho_corasick::AhoCorasick;
 use rayon::prelude::*;
 use regex::bytes::Regex;
 
@@ -20,6 +21,7 @@ pub struct SecretPattern {
     pub name: String,
     pub regex: Regex,
     pub capture_group: Option<usize>,
+    pub prefilter: Option<AhoCorasick>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,15 @@ pub struct Detection {
 
 fn map_detect_err<T>(stage: &str, result: io::Result<T>) -> FilterRepoResult<T> {
     result.map_err(|err| FilterRepoError::detect(stage, err))
+}
+
+fn build_prefilter(literals: &[&[u8]]) -> io::Result<Option<AhoCorasick>> {
+    if literals.is_empty() {
+        return Ok(None);
+    }
+    AhoCorasick::new(literals)
+        .map(Some)
+        .map_err(|e| io::Error::other(format!("invalid detect prefilter: {e}")))
 }
 
 pub fn run(opts: &Options) -> FilterRepoResult<()> {
@@ -71,6 +82,7 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
         regex: Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
             .map_err(|e| io::Error::other(format!("invalid aws_access_key_id regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"AKIA", b"ASIA"])?,
     });
     patterns.push(SecretPattern {
         name: "aws_secret_access_key".to_string(),
@@ -79,24 +91,28 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
         )
         .map_err(|e| io::Error::other(format!("invalid aws_secret_access_key regex: {e}")))?,
         capture_group: Some(1),
+        prefilter: None,
     });
     patterns.push(SecretPattern {
         name: "github_token".to_string(),
         regex: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36}\b")
             .map_err(|e| io::Error::other(format!("invalid github_token regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_"])?,
     });
     patterns.push(SecretPattern {
         name: "github_pat".to_string(),
         regex: Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,255}\b")
             .map_err(|e| io::Error::other(format!("invalid github_pat regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"github_pat_"])?,
     });
     patterns.push(SecretPattern {
         name: "slack_token".to_string(),
         regex: Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,128}\b")
             .map_err(|e| io::Error::other(format!("invalid slack_token regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"xoxb-", b"xoxa-", b"xoxp-", b"xoxr-", b"xoxs-"])?,
     });
     patterns.push(SecretPattern {
         name: "slack_webhook_url".to_string(),
@@ -105,12 +121,14 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
         )
         .map_err(|e| io::Error::other(format!("invalid slack_webhook_url regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"https://hooks.slack.com/services/"])?,
     });
     patterns.push(SecretPattern {
         name: "google_api_key".to_string(),
         regex: Regex::new(r"\bAIza[0-9A-Za-z_-]{35}\b")
             .map_err(|e| io::Error::other(format!("invalid google_api_key regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"AIza"])?,
     });
     patterns.push(SecretPattern {
         name: "google_oauth_refresh_token".to_string(),
@@ -118,24 +136,28 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
             io::Error::other(format!("invalid google_oauth_refresh_token regex: {e}"))
         })?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"1//"])?,
     });
     patterns.push(SecretPattern {
         name: "gitlab_pat".to_string(),
         regex: Regex::new(r"\bglpat-[0-9A-Za-z_-]{20,}\b")
             .map_err(|e| io::Error::other(format!("invalid gitlab_pat regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"glpat-"])?,
     });
     patterns.push(SecretPattern {
         name: "npm_token".to_string(),
         regex: Regex::new(r"\bnpm_[A-Za-z0-9]{36}\b")
             .map_err(|e| io::Error::other(format!("invalid npm_token regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"npm_"])?,
     });
     patterns.push(SecretPattern {
         name: "pypi_token".to_string(),
         regex: Regex::new(r"\bpypi-[A-Za-z0-9_-]{40,}\b")
             .map_err(|e| io::Error::other(format!("invalid pypi_token regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"pypi-"])?,
     });
     patterns.push(SecretPattern {
         name: "stripe_secret_or_restricted_key".to_string(),
@@ -145,12 +167,14 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
             ))
         })?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"sk_live_", b"sk_test_", b"rk_live_", b"rk_test_"])?,
     });
     patterns.push(SecretPattern {
         name: "jwt".to_string(),
         regex: Regex::new(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}\b")
             .map_err(|e| io::Error::other(format!("invalid jwt regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"eyJ"])?,
     });
     // OpenAI API keys: sk-... or sk-proj-...
     patterns.push(SecretPattern {
@@ -158,24 +182,28 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
         regex: Regex::new(r"\b(?:sk-|sk-proj-)[A-Za-z0-9_-]{20,200}\b")
             .map_err(|e| io::Error::other(format!("invalid openai_api_key regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"sk-"])?,
     });
     patterns.push(SecretPattern {
         name: "anthropic_api_key".to_string(),
         regex: Regex::new(r"\bsk-ant-[A-Za-z0-9_-]{16,256}\b")
             .map_err(|e| io::Error::other(format!("invalid anthropic_api_key regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"sk-ant-"])?,
     });
     patterns.push(SecretPattern {
         name: "xai_api_key".to_string(),
         regex: Regex::new(r"\bxai-[A-Za-z0-9_-]{16,256}\b")
             .map_err(|e| io::Error::other(format!("invalid xai_api_key regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"xai-"])?,
     });
     patterns.push(SecretPattern {
         name: "zai_api_key".to_string(),
         regex: Regex::new(r"\bzai-[A-Za-z0-9_-]{16,256}\b")
             .map_err(|e| io::Error::other(format!("invalid zai_api_key regex: {e}")))?,
         capture_group: None,
+        prefilter: build_prefilter(&[b"zai-"])?,
     });
     patterns.push(SecretPattern {
         name: "llm_vendor_key_assignment".to_string(),
@@ -184,6 +212,7 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
         )
         .map_err(|e| io::Error::other(format!("invalid llm_vendor_key_assignment regex: {e}")))?,
         capture_group: Some(1),
+        prefilter: None,
     });
     patterns.push(SecretPattern {
         name: "azure_storage_account_key".to_string(),
@@ -192,18 +221,21 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
                 io::Error::other(format!("invalid azure_storage_account_key regex: {e}"))
             })?,
         capture_group: Some(1),
+        prefilter: None,
     });
     patterns.push(SecretPattern {
         name: "authorization_bearer".to_string(),
         regex: Regex::new(r"(?i)\bauthorization\b\s*[:=]\s*bearer\s+([A-Za-z0-9._-]{20,})")
             .map_err(|e| io::Error::other(format!("invalid authorization_bearer regex: {e}")))?,
         capture_group: Some(1),
+        prefilter: None,
     });
     patterns.push(SecretPattern {
         name: "db_url_password".to_string(),
         regex: Regex::new(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:([^/\s@]{8,})@[^/\s]+")
             .map_err(|e| io::Error::other(format!("invalid db_url_password regex: {e}")))?,
         capture_group: Some(1),
+        prefilter: None,
     });
     patterns.push(SecretPattern {
         name: "assignment_value".to_string(),
@@ -212,6 +244,7 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
         )
         .map_err(|e| io::Error::other(format!("invalid assignment_value regex: {e}")))?,
         capture_group: Some(1),
+        prefilter: None,
     });
 
     for (idx, raw) in opts.detect_patterns.iter().enumerate() {
@@ -232,6 +265,7 @@ fn build_patterns(opts: &Options) -> io::Result<Vec<SecretPattern>> {
             name: format!("custom_pattern_{}", idx + 1),
             regex,
             capture_group,
+            prefilter: None,
         });
     }
     Ok(patterns)
@@ -464,6 +498,11 @@ pub fn collect_blob_detections(
 ) -> Vec<Detection> {
     let mut detections = Vec::new();
     for pattern in patterns {
+        if let Some(prefilter) = &pattern.prefilter {
+            if prefilter.find(payload).is_none() {
+                continue;
+            }
+        }
         for captures in pattern.regex.captures_iter(payload) {
             let matched = if let Some(group_idx) = pattern.capture_group {
                 captures.get(group_idx)
@@ -588,4 +627,66 @@ fn run_git_capture(repo: &Path, args: &[&str]) -> io::Result<std::process::Outpu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(prefix: &[u8], fill: u8, fill_len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(prefix.len() + fill_len);
+        out.extend_from_slice(prefix);
+        out.extend(std::iter::repeat_n(fill, fill_len));
+        out
+    }
+
+    #[test]
+    fn prefiltered_default_patterns_still_detect_matching_values() {
+        let patterns = build_patterns(&Options::default()).expect("build default detect patterns");
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let slack_webhook = [
+            b"https://hooks" as &[u8],
+            b".slack.com/services/T12345678/B12345678/",
+            b"abcdefghijklmnopqrstuvwx",
+        ]
+        .concat();
+        let jwt = [
+            b"eyJ" as &[u8],
+            b"AAAAAAAAAA",
+            b".BBBBBBBBBB",
+            b".CCCCCCCCCC",
+        ]
+        .concat();
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("aws_access_key_id", token(b"AKIA", b'A', 16)),
+            ("github_token", token(b"ghp_", b'A', 36)),
+            ("github_pat", token(b"github_pat_", b'A', 20)),
+            ("slack_token", token(b"xoxb-", b'A', 20)),
+            ("slack_webhook_url", slack_webhook),
+            ("google_api_key", token(b"AIza", b'A', 35)),
+            ("google_oauth_refresh_token", token(b"1//", b'A', 20)),
+            ("gitlab_pat", token(b"glpat-", b'A', 20)),
+            ("npm_token", token(b"npm_", b'A', 36)),
+            ("pypi_token", token(b"pypi-", b'A', 40)),
+            (
+                "stripe_secret_or_restricted_key",
+                token(b"sk_live_", b'A', 16),
+            ),
+            ("jwt", jwt),
+            ("openai_api_key", token(b"sk-", b'A', 20)),
+            ("anthropic_api_key", token(b"sk-ant-", b'A', 16)),
+            ("xai_api_key", token(b"xai-", b'A', 16)),
+            ("zai_api_key", token(b"zai-", b'A', 16)),
+        ];
+
+        for (pattern_name, value) in cases {
+            let detections = collect_blob_detections(&value, oid, Some("fixture.txt"), &patterns);
+            assert!(
+                detections.iter().any(|d| d.pattern == pattern_name),
+                "{pattern_name} should detect {}",
+                String::from_utf8_lossy(&value)
+            );
+        }
+    }
 }

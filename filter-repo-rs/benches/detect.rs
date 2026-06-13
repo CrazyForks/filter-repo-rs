@@ -3,8 +3,16 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 #[path = "../tests/common/fake_secrets.rs"]
 mod fake_secrets;
 
+use aho_corasick::AhoCorasick;
 use filter_repo_rs::detect::{collect_blob_detections, SecretPattern};
 use regex::bytes::Regex;
+
+fn prefilter(literals: &[&[u8]]) -> Option<AhoCorasick> {
+    if literals.is_empty() {
+        return None;
+    }
+    Some(AhoCorasick::new(literals).unwrap())
+}
 
 fn build_default_patterns() -> Vec<SecretPattern> {
     vec![
@@ -12,21 +20,25 @@ fn build_default_patterns() -> Vec<SecretPattern> {
             name: "aws_access_key_id".into(),
             regex: Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b").unwrap(),
             capture_group: None,
+            prefilter: prefilter(&[b"AKIA", b"ASIA"]),
         },
         SecretPattern {
             name: "github_token".into(),
             regex: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36}\b").unwrap(),
             capture_group: None,
+            prefilter: prefilter(&[b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_"]),
         },
         SecretPattern {
             name: "slack_token".into(),
             regex: Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,128}\b").unwrap(),
             capture_group: None,
+            prefilter: prefilter(&[b"xoxb-", b"xoxa-", b"xoxp-", b"xoxr-", b"xoxs-"]),
         },
         SecretPattern {
             name: "google_api_key".into(),
             regex: Regex::new(r"\bAIza[0-9A-Za-z_-]{35}\b").unwrap(),
             capture_group: None,
+            prefilter: prefilter(&[b"AIza"]),
         },
         SecretPattern {
             name: "jwt".into(),
@@ -35,11 +47,13 @@ fn build_default_patterns() -> Vec<SecretPattern> {
             )
             .unwrap(),
             capture_group: None,
+            prefilter: prefilter(&[b"eyJ"]),
         },
         SecretPattern {
             name: "openai_api_key".into(),
             regex: Regex::new(r"\b(?:sk-|sk-proj-)[A-Za-z0-9_-]{20,200}\b").unwrap(),
             capture_group: None,
+            prefilter: prefilter(&[b"sk-"]),
         },
         SecretPattern {
             name: "assignment_value".into(),
@@ -48,11 +62,13 @@ fn build_default_patterns() -> Vec<SecretPattern> {
             )
             .unwrap(),
             capture_group: Some(1),
+            prefilter: None,
         },
         SecretPattern {
             name: "db_url_password".into(),
             regex: Regex::new(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:([^/\s@]{8,})@[^/\s]+").unwrap(),
             capture_group: Some(1),
+            prefilter: None,
         },
     ]
 }
