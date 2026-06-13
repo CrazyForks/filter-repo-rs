@@ -1,6 +1,7 @@
 use crate::opts::Options;
 use crate::pathutil::{
-    dequote_c_style_bytes, encode_path_for_fi_with_policy, glob_match_bytes, PathCompatEvent,
+    dequote_c_style_bytes, encode_path_for_fi_with_policy, glob_match_bytes, needs_c_style_quote,
+    PathCompatEvent, PathCompatPolicy,
 };
 
 #[derive(Debug)]
@@ -190,11 +191,81 @@ fn encode_path_with_policy(
     Ok(encoded)
 }
 
+fn is_plain_fast_import_path(path: &[u8]) -> bool {
+    !path.is_empty() && path.first() != Some(&b'"') && !needs_c_style_quote(path)
+}
+
+fn can_passthrough_file_change_line(line: &[u8], opts: &Options) -> bool {
+    if cfg!(windows)
+        || opts.path_compat_policy != PathCompatPolicy::Sanitize
+        || !opts.paths.is_empty()
+        || !opts.path_globs.is_empty()
+        || !opts.path_regexes.is_empty()
+        || !opts.path_renames.is_empty()
+    {
+        return false;
+    }
+
+    let Some(body) = line.strip_suffix(b"\n") else {
+        return false;
+    };
+    if body.ends_with(b"\r") {
+        return false;
+    }
+    if body == b"deleteall" {
+        return true;
+    }
+
+    let mut parts = body.split(|b| *b == b' ');
+    match parts.next() {
+        Some(b"M") => {
+            let Some(mode) = parts.next() else {
+                return false;
+            };
+            let Some(id) = parts.next() else {
+                return false;
+            };
+            let Some(path) = parts.next() else {
+                return false;
+            };
+            !mode.is_empty()
+                && !id.is_empty()
+                && is_plain_fast_import_path(path)
+                && parts.next().is_none()
+        }
+        Some(b"D") => {
+            let Some(path) = parts.next() else {
+                return false;
+            };
+            is_plain_fast_import_path(path) && parts.next().is_none()
+        }
+        Some(b"C" | b"R") => {
+            let Some(src) = parts.next() else {
+                return false;
+            };
+            let Some(dst) = parts.next() else {
+                return false;
+            };
+            is_plain_fast_import_path(src)
+                && is_plain_fast_import_path(dst)
+                && parts.next().is_none()
+        }
+        _ => false,
+    }
+}
+
 // Return Some(new_line) if the filechange should be kept (possibly rebuilt), None to drop.
 pub fn handle_file_change_line(
     line: &[u8],
     opts: &Options,
 ) -> Result<HandleFileChangeOutcome, String> {
+    if can_passthrough_file_change_line(line, opts) {
+        return Ok(HandleFileChangeOutcome {
+            line: Some(line.to_vec()),
+            path_compat_events: Vec::new(),
+        });
+    }
+
     let parsed = match parse_file_change_line(line) {
         Some(p) => p,
         None => {
@@ -334,5 +405,49 @@ pub fn handle_file_change_line(
                 path_compat_events,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_accepts_simple_modify_when_no_path_rules() {
+        let opts = Options::default();
+        assert!(can_passthrough_file_change_line(
+            b"M 100644 :42 src/main.rs\n",
+            &opts
+        ));
+    }
+
+    #[test]
+    fn passthrough_rejects_quoted_path() {
+        let opts = Options::default();
+        assert!(!can_passthrough_file_change_line(
+            b"M 100644 :42 \"src/my module.rs\"\n",
+            &opts
+        ));
+    }
+
+    #[test]
+    fn passthrough_rejects_crlf_that_would_be_normalized() {
+        let opts = Options::default();
+        assert!(!can_passthrough_file_change_line(
+            b"M 100644 :42 src/main.rs\r\n",
+            &opts
+        ));
+    }
+
+    #[test]
+    fn passthrough_rejects_when_path_rules_are_configured() {
+        let opts = Options {
+            paths: vec![b"src/".to_vec()],
+            ..Options::default()
+        };
+        assert!(!can_passthrough_file_change_line(
+            b"M 100644 :42 src/main.rs\n",
+            &opts
+        ));
     }
 }
