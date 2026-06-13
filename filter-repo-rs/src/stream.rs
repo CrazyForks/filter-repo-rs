@@ -82,18 +82,26 @@ fn rewrite_timestamp_line<'a>(line: &'a [u8], opts: &Options) -> Cow<'a, [u8]> {
     )
 }
 
-fn rewrite_commit_identity_line(
-    line: &[u8],
+fn rewrite_commit_identity_line<'a>(
+    line: &'a [u8],
     opts: &Options,
     author_rewriter: Option<&AuthorRewriter>,
     committer_rewriter: Option<&AuthorRewriter>,
     email_rewriter: Option<&AuthorRewriter>,
     mailmap_rewriter: Option<&MailmapRewriter>,
-) -> Vec<u8> {
+) -> Cow<'a, [u8]> {
     let is_author_line = line.starts_with(b"author ");
     let is_committer_line = line.starts_with(b"committer ");
     if !is_author_line && !is_committer_line {
-        return line.to_vec();
+        return Cow::Borrowed(line);
+    }
+
+    if author_rewriter.is_none()
+        && committer_rewriter.is_none()
+        && email_rewriter.is_none()
+        && mailmap_rewriter.is_none()
+    {
+        return rewrite_timestamp_line(line, opts);
     }
 
     let mut rewritten = line.to_vec();
@@ -115,7 +123,7 @@ fn rewrite_commit_identity_line(
         }
     }
 
-    rewrite_timestamp_line(&rewritten, opts).into_owned()
+    Cow::Owned(rewrite_timestamp_line(&rewritten, opts).into_owned())
 }
 
 #[doc(hidden)]
@@ -132,6 +140,26 @@ pub fn benchmark_rewrite_commit_identity_line(
     email_rewriter: Option<&AuthorRewriter>,
     mailmap_rewriter: Option<&MailmapRewriter>,
 ) -> Vec<u8> {
+    rewrite_commit_identity_line(
+        line,
+        opts,
+        author_rewriter,
+        committer_rewriter,
+        email_rewriter,
+        mailmap_rewriter,
+    )
+    .into_owned()
+}
+
+#[doc(hidden)]
+pub fn benchmark_rewrite_commit_identity_line_cow<'a>(
+    line: &'a [u8],
+    opts: &Options,
+    author_rewriter: Option<&AuthorRewriter>,
+    committer_rewriter: Option<&AuthorRewriter>,
+    email_rewriter: Option<&AuthorRewriter>,
+    mailmap_rewriter: Option<&MailmapRewriter>,
+) -> Cow<'a, [u8]> {
     rewrite_commit_identity_line(
         line,
         opts,
@@ -1941,7 +1969,7 @@ impl<'a> StreamProcessor<'a> {
                         let short_mapper = short_hash_mapper.as_ref();
                         let mut path_events = Vec::new();
                         match crate::commit::process_commit_line(
-                            &processed_line,
+                            processed_line.as_ref(),
                             opts,
                             &mut fe_out,
                             orig_file_opt.as_mut().map(|w| w as &mut dyn Write),

@@ -25,7 +25,10 @@ pub use self::error::{FilterRepoError, Result as FilterRepoResult};
 pub use opts::{AnalyzeConfig, AnalyzeThresholds, Mode, Options};
 pub use pathutil::dequote_c_style_bytes;
 #[doc(hidden)]
-pub use stream::{benchmark_rewrite_commit_identity_line, benchmark_rewrite_timestamp_line};
+pub use stream::{
+    benchmark_rewrite_commit_identity_line, benchmark_rewrite_commit_identity_line_cow,
+    benchmark_rewrite_timestamp_line,
+};
 
 fn validate_options(opts: &Options) -> FilterRepoResult<()> {
     if !opts.detect_secrets && !opts.detect_patterns.is_empty() {

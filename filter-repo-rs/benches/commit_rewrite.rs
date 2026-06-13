@@ -3,7 +3,8 @@ use std::io::BufReader;
 
 use filter_repo_rs::commit::{AuthorRewriter, MailmapRewriter};
 use filter_repo_rs::{
-    benchmark_rewrite_commit_identity_line, benchmark_rewrite_timestamp_line, Options,
+    benchmark_rewrite_commit_identity_line, benchmark_rewrite_commit_identity_line_cow,
+    benchmark_rewrite_timestamp_line, Options,
 };
 
 // ---------------------------------------------------------------------------
@@ -175,7 +176,7 @@ fn bench_stream_rewrite_helpers(c: &mut Criterion) {
 
     group.bench_function("identity/noop", |b| {
         b.iter(|| {
-            benchmark_rewrite_commit_identity_line(
+            benchmark_rewrite_commit_identity_line_cow(
                 black_box(author_line),
                 black_box(&opts_noop),
                 None,
@@ -188,7 +189,7 @@ fn bench_stream_rewrite_helpers(c: &mut Criterion) {
 
     group.bench_function("identity/date_shift", |b| {
         b.iter(|| {
-            benchmark_rewrite_commit_identity_line(
+            benchmark_rewrite_commit_identity_line_cow(
                 black_box(committer_line),
                 black_box(&opts_shift),
                 None,
