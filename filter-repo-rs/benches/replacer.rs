@@ -65,6 +65,13 @@ fn bench_message_replacer(c: &mut Criterion) {
         // No-match path (the common case we optimized)
         let payload_miss = make_payload(size, false);
         group.bench_with_input(
+            BenchmarkId::new("apply/miss", &label),
+            &payload_miss,
+            |b, data| {
+                b.iter(|| replacer.apply(black_box(data.clone())));
+            },
+        );
+        group.bench_with_input(
             BenchmarkId::new("apply_with_change/miss", &label),
             &payload_miss,
             |b, data| {
@@ -74,6 +81,13 @@ fn bench_message_replacer(c: &mut Criterion) {
 
         // Match path
         let payload_hit = make_payload(size, true);
+        group.bench_with_input(
+            BenchmarkId::new("apply/hit", &label),
+            &payload_hit,
+            |b, data| {
+                b.iter(|| replacer.apply(black_box(data.clone())));
+            },
+        );
         group.bench_with_input(
             BenchmarkId::new("apply_with_change/hit", &label),
             &payload_hit,

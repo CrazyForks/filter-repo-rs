@@ -115,6 +115,13 @@ impl MessageReplacer {
     }
 
     pub fn apply(&self, data: Vec<u8>) -> Vec<u8> {
+        if !self.would_change(&data) {
+            return data;
+        }
+        self.apply_replacements(data)
+    }
+
+    fn apply_replacements(&self, data: Vec<u8>) -> Vec<u8> {
         let mut result = data;
         for (from, to) in &self.pairs {
             result = replace_all_bytes(&result, from, to);
@@ -135,7 +142,7 @@ impl MessageReplacer {
         if !self.would_change(&data) {
             return (data, false);
         }
-        (self.apply(data), true)
+        (self.apply_replacements(data), true)
     }
 
     #[cfg(test)]
