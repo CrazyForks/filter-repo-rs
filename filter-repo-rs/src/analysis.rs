@@ -1,15 +1,17 @@
 use colored::{Color, Colorize};
 use comfy_table::{
-    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, CellAlignment,
-    ContentArrangement, Table,
+    modifiers::UTF8_ROUND_CORNERS,
+    presets::{ASCII_FULL, UTF8_FULL},
+    Attribute, Cell, CellAlignment, ContentArrangement, Table,
 };
 use serde::Serialize;
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::thread;
 use std::time::Instant;
 
 use crate::gitutil;
@@ -78,6 +80,25 @@ pub struct Warning {
     pub recommendation: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Concern {
+    Ok,
+    Info,
+    Warning,
+    Critical,
+}
+
+impl Concern {
+    fn label(self) -> &'static str {
+        match self {
+            Concern::Ok => "OK",
+            Concern::Info => "Info",
+            Concern::Warning => "Warning",
+            Concern::Critical => "Critical",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ObjectStat {
     pub oid: String,
@@ -123,15 +144,26 @@ pub struct RepositoryMetrics {
     pub total_objects: u64,
     pub total_size_bytes: u64,
     pub object_types: BTreeMap<String, u64>,
+    pub object_type_sizes: BTreeMap<String, u64>,
     pub tree_total_size_bytes: u64,
+    pub total_tree_entries: u64,
+    pub checkout_files: u64,
+    pub checkout_directories: u64,
+    pub checkout_total_size_bytes: u64,
+    pub checkout_max_path_depth: usize,
+    pub checkout_symlinks: u64,
+    pub checkout_submodules: u64,
     pub refs_total: usize,
     pub refs_heads: usize,
     pub refs_tags: usize,
     pub refs_remotes: usize,
     pub refs_other: usize,
+    pub largest_commits: Vec<ObjectStat>,
     pub largest_blobs: Vec<ObjectStat>,
     pub largest_files: Vec<FileStat>,
     pub largest_trees: Vec<ObjectStat>,
+    pub largest_tags: Vec<ObjectStat>,
+    pub max_tree_entries: Option<DirectoryStat>,
     pub blobs_over_threshold: Vec<ObjectStat>,
     pub directory_hotspots: Option<DirectoryStat>,
     pub longest_path: Option<PathStat>,
@@ -151,6 +183,14 @@ struct BlobSizeStats {
     unpacked_size: HashMap<String, u64>,
     packed_size: HashMap<String, u64>,
     processed_objects: usize,
+}
+
+#[derive(Debug, Default)]
+struct ReachableInventory {
+    oids: Vec<String>,
+    object_types: HashMap<String, String>,
+    object_sizes: HashMap<String, u64>,
+    paths_by_oid: HashMap<String, Vec<String>>,
 }
 
 pub fn run(opts: &Options) -> io::Result<()> {
@@ -179,7 +219,7 @@ pub fn run(opts: &Options) -> io::Result<()> {
         if opts.write_report {
             let report_path = debug_dir.join("report.txt");
             let mut f = File::create(&report_path)?;
-            write_text_report(&mut f, &report)?;
+            write_text_report(&mut f, &report, &opts.analyze)?;
             eprintln!("Analysis report written to {}", report_path.display());
         }
 
@@ -196,171 +236,108 @@ pub fn run(opts: &Options) -> io::Result<()> {
     Ok(())
 }
 
-/// Write a text format analysis report to the given writer.
-fn write_text_report<W: Write>(f: &mut W, report: &AnalysisReport) -> io::Result<()> {
-    let m = &report.metrics;
-
-    writeln!(f, "=== Repository Analysis Report ===")?;
-    writeln!(f, "Workdir: {}", m.workdir.as_deref().unwrap_or("N/A"))?;
-    writeln!(f)?;
-
-    writeln!(f, "=== Repository Summary ===")?;
-    writeln!(f, "Total objects: {}", m.total_objects)?;
+/// Write a plain text analysis report to the given writer using the same row
+/// builders as the terminal renderer.
+fn write_text_report<W: Write>(
+    f: &mut W,
+    report: &AnalysisReport,
+    cfg: &AnalyzeConfig,
+) -> io::Result<()> {
+    writeln!(f, "Repository analysis")?;
     writeln!(
         f,
-        "Total size: {} bytes ({:.2} MiB)",
-        m.total_size_bytes,
-        m.total_size_bytes as f64 / 1024.0 / 1024.0
-    )?;
-    writeln!(
-        f,
-        "Loose objects: {} ({} bytes)",
-        m.loose_objects, m.loose_size_bytes
-    )?;
-    writeln!(
-        f,
-        "Packed objects: {} ({} bytes)",
-        m.packed_objects, m.packed_size_bytes
+        "Workdir: {}",
+        report.metrics.workdir.as_deref().unwrap_or("N/A")
     )?;
     writeln!(f)?;
 
-    writeln!(f, "=== Objects ===")?;
-    writeln!(
+    write_plain_rows(f, "Repository summary", build_summary_rows(report, cfg))?;
+    write_plain_rows(
         f,
-        "Commits: {}",
-        m.object_types.get("commit").copied().unwrap_or(0)
+        "Object types",
+        build_object_type_rows(&report.metrics, cfg),
     )?;
-    writeln!(
-        f,
-        "Blobs: {}",
-        m.object_types.get("blob").copied().unwrap_or(0)
-    )?;
-    writeln!(
-        f,
-        "Trees: {}",
-        m.object_types.get("tree").copied().unwrap_or(0)
-    )?;
-    writeln!(
-        f,
-        "Tags: {}",
-        m.object_types.get("tag").copied().unwrap_or(0)
-    )?;
-    writeln!(f, "Max commit parents: {}", m.max_commit_parents)?;
-    writeln!(f)?;
-
-    writeln!(f, "=== References ===")?;
-    writeln!(f, "Total refs: {}", m.refs_total)?;
-    writeln!(f, "  Heads: {}", m.refs_heads)?;
-    writeln!(f, "  Tags: {}", m.refs_tags)?;
-    writeln!(f, "  Remotes: {}", m.refs_remotes)?;
-    writeln!(f, "  Other: {}", m.refs_other)?;
-    writeln!(f)?;
-
-    if !m.largest_blobs.is_empty() {
-        writeln!(f, "=== Largest Blobs (Top {}) ===", m.largest_blobs.len())?;
-        for (i, blob) in m.largest_blobs.iter().enumerate() {
-            writeln!(
-                f,
-                "  {}. OID: {}, Size: {} bytes",
-                i + 1,
-                blob.oid,
-                blob.size
-            )?;
-            if let Some(ref path) = blob.path {
-                writeln!(f, "      Path: {}", path)?;
-            }
-        }
-        writeln!(f)?;
+    let checkout_rows = build_checkout_rows(&report.metrics, cfg);
+    if !checkout_rows.is_empty() {
+        write_plain_rows(f, "Checkout (HEAD)", checkout_rows)?;
     }
 
-    if !m.largest_files.is_empty() {
-        writeln!(
-            f,
-            "=== Largest Files by History (Top {}) ===",
-            m.largest_files.len()
-        )?;
-        for (i, file) in m.largest_files.iter().enumerate() {
+    if !report.metrics.largest_files.is_empty() {
+        writeln!(f, "Top files by size")?;
+        for file in &report.metrics.largest_files {
             writeln!(
                 f,
-                "  {}. Path: {}, Size: {} bytes, Versions: {}",
-                i + 1,
+                "- {} | {} | {} versions | {}",
                 file.path,
-                file.size,
-                file.versions
+                format_bytes(file.size),
+                file.versions,
+                &file.largest_oid[..file.largest_oid.len().min(8)]
             )?;
         }
         writeln!(f)?;
     }
 
-    if !m.blobs_over_threshold.is_empty() {
-        writeln!(
-            f,
-            "=== Blobs Over Threshold (Top {}) ===",
-            m.blobs_over_threshold.len()
-        )?;
-        for (i, blob) in m.blobs_over_threshold.iter().enumerate() {
+    if !report.metrics.largest_blobs.is_empty() {
+        writeln!(f, "Top blobs by size")?;
+        for blob in &report.metrics.largest_blobs {
             writeln!(
                 f,
-                "  {}. OID: {}, Size: {} bytes",
-                i + 1,
-                blob.oid,
-                blob.size
+                "- {} | {} | {}",
+                format_bytes(blob.size),
+                &blob.oid[..blob.oid.len().min(8)],
+                blob.path.as_deref().unwrap_or("")
             )?;
-            if let Some(ref path) = blob.path {
-                writeln!(f, "      Path: {}", path)?;
-            }
         }
         writeln!(f)?;
     }
 
-    if let Some(ref dir) = m.directory_hotspots {
-        writeln!(f, "=== Directory Hotspot ===")?;
-        writeln!(f, "  Path: {}, Entries: {}", dir.path, dir.entries)?;
-        writeln!(f)?;
-    }
-
-    if let Some(ref path) = m.longest_path {
-        writeln!(f, "=== Longest Path ===")?;
-        writeln!(f, "  Path: {}, Length: {} chars", path.path, path.length)?;
-        writeln!(f)?;
-    }
-
-    if !m.oversized_commit_messages.is_empty() {
-        writeln!(
-            f,
-            "=== Oversized Commit Messages (Top {}) ===",
-            m.oversized_commit_messages.len()
-        )?;
-        for (i, msg) in m.oversized_commit_messages.iter().enumerate() {
+    if !report.metrics.largest_trees.is_empty() {
+        writeln!(f, "Top trees by size")?;
+        for tree in &report.metrics.largest_trees {
             writeln!(
                 f,
-                "  {}. Commit: {}, Length: {} bytes",
-                i + 1,
-                msg.oid,
-                msg.length
+                "- {} | {}",
+                format_bytes(tree.size),
+                &tree.oid[..tree.oid.len().min(8)]
             )?;
         }
         writeln!(f)?;
     }
 
-    writeln!(f, "=== Warnings ({}) ===", report.warnings.len())?;
-    if report.warnings.is_empty() {
-        writeln!(f, "  No warnings.")?;
-    } else {
-        for (i, w) in report.warnings.iter().enumerate() {
+    if !report.metrics.oversized_commit_messages.is_empty() {
+        writeln!(f, "Oversized commit messages")?;
+        for msg in &report.metrics.oversized_commit_messages {
             writeln!(
                 f,
-                "  {}. [{}] {}",
-                i + 1,
-                format!("{:?}", w.level).to_uppercase(),
-                w.message
+                "- {} bytes | {}",
+                msg.length,
+                &msg.oid[..msg.oid.len().min(8)]
             )?;
-            if let Some(ref rec) = w.recommendation {
-                writeln!(f, "      Recommendation: {}", rec)?;
-            }
         }
+        writeln!(f)?;
     }
 
+    Ok(())
+}
+
+fn write_plain_rows<W: Write>(
+    f: &mut W,
+    title: &str,
+    rows: Vec<Vec<Cow<'_, str>>>,
+) -> io::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writeln!(f, "{}", title)?;
+    for row in rows {
+        let line = row
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        writeln!(f, "- {}", line)?;
+    }
+    writeln!(f)?;
     Ok(())
 }
 
@@ -382,87 +359,44 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
 
     eprintln_color(Color::Cyan, "[*] Starting repository analysis...");
 
-    // First, get all blob sizes in one pass
-    eprintln_color(Color::Cyan, "[*] Gathering blob sizes...");
-    let (unpacked_size, packed_size) = gather_all_blob_sizes(repo)?;
+    // First, get one reachable object universe and size it.
+    eprintln_color(Color::Cyan, "[*] Gathering reachable object inventory...");
+    let inventory = gather_reachable_inventory(repo)?;
 
     // Initialize metrics with blob sizes - pre-allocate reasonable capacities
-    let estimated_blobs = unpacked_size.len();
-    let _blob_paths: HashMap<String, Vec<String>> = HashMap::new();
+    let estimated_blobs = inventory
+        .object_types
+        .values()
+        .filter(|kind| kind.as_str() == "blob")
+        .count();
     let mut stats = StatsCollection {
         blob_paths: HashMap::with_capacity(estimated_blobs),
-        all_names: HashSet::with_capacity(estimated_blobs * 2), // Rough estimate
-        num_commits: 0,
         max_parents: 0,
     };
 
-    // Then process commit history
-    eprintln_color(Color::Cyan, "[*] Processing commit history...");
-    gather_commit_history(repo, &mut stats)?;
-
     // Determine maximum number of parents across all commits
+    eprintln_color(Color::Cyan, "[*] Processing commit history...");
     if let Ok(maxp) = gather_max_parents(repo) {
         stats.max_parents = maxp;
     }
 
-    // Now map blob OIDs to paths efficiently using the collected blob sizes
-    eprintln_color(Color::Cyan, "[*] Mapping blob paths (streaming)...");
-    let blob_oids: HashSet<String> = unpacked_size.keys().cloned().collect();
-
-    // Use streaming approach to avoid loading all objects into memory
-    let mut blob_path_map: HashMap<String, String> = HashMap::new();
-    let (mut reader, mut child) =
-        run_git_capture_stream(repo, &["rev-list", "--objects", "--all"])?;
-
-    let mut line_buf = String::new();
-    while reader.read_line(&mut line_buf)? > 0 {
-        if blob_path_map.len() < blob_oids.len() {
-            let line = line_buf.trim_end();
-            let mut parts = line.splitn(2, ' ');
-            if let (Some(oid), Some(path)) = (parts.next(), parts.next()) {
-                if blob_oids.contains(oid) && !path.is_empty() {
-                    blob_path_map.insert(oid.to_string(), path.to_string());
-                }
-            }
+    for (oid, paths) in &inventory.paths_by_oid {
+        if inventory
+            .object_types
+            .get(oid)
+            .is_some_and(|kind| kind == "blob")
+        {
+            stats.blob_paths.insert(oid.clone(), paths.clone());
         }
-        line_buf.clear();
     }
 
-    // Wait for git command to complete
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "git rev-list --objects --all failed: {}",
-            status
-        )));
-    }
-
-    eprintln_color(
-        Color::Green,
-        &format!("[*] Found {} blob-to-path mappings", blob_path_map.len()),
-    );
-
-    // Convert path map (oid -> path) to blob_paths structure (oid -> Vec<path>)
-    for (oid, path) in blob_path_map {
-        stats
-            .blob_paths
-            .entry(oid.clone())
-            .or_default()
-            .push(path.clone());
-        stats.all_names.insert(path);
-    }
-
-    // Quick repository stats
+    // Optional physical object database stats. These are not used for headline totals.
     gather_footprint(repo, &mut metrics)?;
     gather_refs(repo, &mut metrics)?;
 
-    // Update metrics from gathered data
-    metrics
-        .object_types
-        .insert("blob".to_string(), stats.blob_paths.len() as u64);
-    metrics
-        .object_types
-        .insert("commit".to_string(), stats.num_commits);
+    // Update metrics from the reachable object universe.
+    populate_reachable_object_metrics(&mut metrics, &inventory, cfg);
+    gather_tree_entry_metrics(repo, &inventory, &mut metrics)?;
     metrics.max_commit_parents = stats.max_parents;
 
     // Find largest blobs and prepare path mappings
@@ -470,10 +404,7 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
     let mut threshold_hits: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
 
     for oid in stats.blob_paths.keys() {
-        let actual_size = unpacked_size
-            .get(oid)
-            .copied()
-            .unwrap_or_else(|| packed_size.get(oid).copied().unwrap_or(0));
+        let actual_size = inventory.object_sizes.get(oid).copied().unwrap_or(0);
         push_top(&mut largest_blobs, cfg.top, actual_size, oid);
         if actual_size >= cfg.thresholds.warn_blob_bytes {
             push_top(&mut threshold_hits, cfg.top, actual_size, oid);
@@ -487,13 +418,11 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
 
     // Group blobs by file path to find unique files
     metrics.largest_files =
-        compute_largest_files(&stats.blob_paths, &unpacked_size, &packed_size, cfg.top);
-
-    // Tree inventory via cat-file for counts and top sizes (lightweight)
-    eprintln_color(Color::Cyan, "[*] Gathering tree inventory...");
+        compute_largest_files(&stats.blob_paths, &inventory.object_sizes, cfg.top);
 
     // Keep a quick HEAD snapshot for context (simplified)
     eprintln_color(Color::Cyan, "[*] Analyzing working directory...");
+    gather_head_checkout_metrics(repo, &mut metrics)?;
 
     // Gather oversized commit messages based on configured threshold
     metrics.oversized_commit_messages =
@@ -505,8 +434,6 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
 
 struct StatsCollection {
     blob_paths: HashMap<String, Vec<String>>,
-    all_names: HashSet<String>,
-    num_commits: u64,
     max_parents: usize,
 }
 
@@ -524,8 +451,366 @@ fn gather_footprint(repo: &Path, metrics: &mut RepositoryMetrics) -> io::Result<
             _ => {}
         }
     }
-    metrics.total_objects = metrics.loose_objects + metrics.packed_objects;
-    metrics.total_size_bytes = metrics.loose_size_bytes + metrics.packed_size_bytes;
+    Ok(())
+}
+
+fn gather_reachable_inventory(repo: &Path) -> io::Result<ReachableInventory> {
+    let (mut reader, mut child) =
+        run_git_capture_stream(repo, &["rev-list", "--objects", "--all"])?;
+    let mut inventory = ReachableInventory::default();
+    let mut seen = HashSet::new();
+    let mut line_buf = String::new();
+
+    while reader.read_line(&mut line_buf)? > 0 {
+        let line = line_buf.trim_end();
+        if !line.is_empty() {
+            let mut parts = line.splitn(2, ' ');
+            if let Some(oid) = parts.next() {
+                if !oid.is_empty() && seen.insert(oid.to_string()) {
+                    inventory.oids.push(oid.to_string());
+                }
+                if let Some(path) = parts.next() {
+                    if !path.is_empty() {
+                        inventory
+                            .paths_by_oid
+                            .entry(oid.to_string())
+                            .or_default()
+                            .push(path.to_string());
+                    }
+                }
+            }
+        }
+        line_buf.clear();
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "git rev-list --objects --all failed: {}",
+            status
+        )));
+    }
+
+    batch_check_reachable_objects(repo, &mut inventory)?;
+    Ok(inventory)
+}
+
+fn spawn_oid_batch_writer(
+    mut stdin: ChildStdin,
+    oids: Vec<String>,
+) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        for oid in oids {
+            stdin.write_all(oid.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+        Ok(())
+    })
+}
+
+fn batch_check_reachable_objects(
+    repo: &Path,
+    inventory: &mut ReachableInventory,
+) -> io::Result<()> {
+    if inventory.oids.is_empty() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("git")
+        .current_dir(repo)
+        .args([
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("failed to open git cat-file stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture git cat-file stdout"))?;
+    let writer = spawn_oid_batch_writer(stdin, inventory.oids.clone());
+    let mut reader = BufReader::new(stdout);
+    let mut line_buf = String::new();
+
+    while reader.read_line(&mut line_buf)? > 0 {
+        let line = line_buf.trim_end();
+        let mut parts = line.split_whitespace();
+        if let (Some(oid), Some(kind), Some(size)) = (parts.next(), parts.next(), parts.next()) {
+            if let Ok(size) = size.parse::<u64>() {
+                inventory
+                    .object_types
+                    .insert(oid.to_string(), kind.to_string());
+                inventory.object_sizes.insert(oid.to_string(), size);
+            }
+        }
+        line_buf.clear();
+    }
+
+    writer
+        .join()
+        .map_err(|_| io::Error::other("git cat-file oid writer thread panicked"))??;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "git cat-file --batch-check failed: {}",
+            status
+        )));
+    }
+    Ok(())
+}
+
+fn populate_reachable_object_metrics(
+    metrics: &mut RepositoryMetrics,
+    inventory: &ReachableInventory,
+    cfg: &AnalyzeConfig,
+) {
+    // Note: `largest_blobs` and `blobs_over_threshold` are derived later in
+    // `collect_metrics` from the blob-path map, so they are intentionally not
+    // computed here to avoid a redundant pass.
+    let mut largest_commits: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
+    let mut largest_trees: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
+    let mut largest_tags: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
+
+    metrics.total_objects = inventory.object_types.len() as u64;
+    metrics.total_size_bytes = 0;
+    metrics.object_types.clear();
+    metrics.object_type_sizes.clear();
+    metrics.tree_total_size_bytes = 0;
+
+    for (oid, kind) in &inventory.object_types {
+        let size = inventory.object_sizes.get(oid).copied().unwrap_or(0);
+        *metrics.object_types.entry(kind.clone()).or_insert(0) += 1;
+        *metrics.object_type_sizes.entry(kind.clone()).or_insert(0) += size;
+        metrics.total_size_bytes = metrics.total_size_bytes.saturating_add(size);
+
+        match kind.as_str() {
+            "commit" => push_top(&mut largest_commits, cfg.top, size, oid),
+            "tree" => {
+                metrics.tree_total_size_bytes = metrics.tree_total_size_bytes.saturating_add(size);
+                push_top(&mut largest_trees, cfg.top, size, oid);
+            }
+            "tag" => push_top(&mut largest_tags, cfg.top, size, oid),
+            _ => {}
+        }
+    }
+
+    metrics.largest_commits =
+        heap_to_object_stats_with_paths(largest_commits, &inventory.paths_by_oid);
+    metrics.largest_trees = heap_to_object_stats_with_paths(largest_trees, &inventory.paths_by_oid);
+    metrics.largest_tags = heap_to_object_stats_with_paths(largest_tags, &inventory.paths_by_oid);
+}
+
+fn gather_tree_entry_metrics(
+    repo: &Path,
+    inventory: &ReachableInventory,
+    metrics: &mut RepositoryMetrics,
+) -> io::Result<()> {
+    let tree_oids: Vec<String> = metrics
+        .object_types
+        .get("tree")
+        .filter(|&&count| count > 0)
+        .map(|_| {
+            inventory
+                .object_types
+                .iter()
+                .filter(|(_, kind)| *kind == "tree")
+                .map(|(oid, _)| oid.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if tree_oids.is_empty() {
+        return Ok(());
+    }
+
+    let entry_counts = batch_count_tree_entries(repo, tree_oids)?;
+    metrics.total_tree_entries = entry_counts.values().copied().sum();
+    metrics.max_tree_entries = entry_counts
+        .into_iter()
+        .max_by_key(|(_, entries)| *entries)
+        .map(|(oid, entries)| DirectoryStat {
+            path: oid,
+            entries: entries as usize,
+        });
+    Ok(())
+}
+
+fn batch_count_tree_entries(
+    repo: &Path,
+    tree_oids: Vec<String>,
+) -> io::Result<HashMap<String, u64>> {
+    let mut child = Command::new("git")
+        .current_dir(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("failed to open git cat-file stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture git cat-file stdout"))?;
+    let writer = spawn_oid_batch_writer(stdin, tree_oids);
+    let mut reader = BufReader::new(stdout);
+    let mut counts = HashMap::new();
+    let mut header = Vec::with_capacity(96);
+
+    loop {
+        header.clear();
+        if reader.read_until(b'\n', &mut header)? == 0 {
+            break;
+        }
+        if header.ends_with(b"\n") {
+            header.pop();
+        }
+        if header.ends_with(b"\r") {
+            header.pop();
+        }
+        let header_str = String::from_utf8_lossy(&header);
+        let mut parts = header_str.split_whitespace();
+        let Some(oid) = parts.next() else {
+            continue;
+        };
+        let Some(kind) = parts.next() else {
+            continue;
+        };
+        let Some(size) = parts.next().and_then(|s| s.parse::<usize>().ok()) else {
+            continue;
+        };
+
+        let mut payload = vec![0u8; size];
+        reader.read_exact(&mut payload)?;
+        let mut trailing = [0u8; 1];
+        let _ = reader.read_exact(&mut trailing);
+
+        if kind == "tree" {
+            // A tree entry is `<mode> <name>\0<raw-hash>`. The raw hash bytes can
+            // themselves contain 0x00, so counting NUL bytes would overcount; walk
+            // entries by skipping the hash (length derived from the oid hex width).
+            let hash_len = oid.len() / 2;
+            counts.insert(oid.to_string(), count_tree_entries(&payload, hash_len));
+        }
+    }
+
+    writer
+        .join()
+        .map_err(|_| io::Error::other("git cat-file tree writer thread panicked"))??;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "git cat-file --batch failed: {}",
+            status
+        )));
+    }
+    Ok(counts)
+}
+
+/// Count the entries in a raw git tree payload. Each entry is
+/// `<mode> <name>\0<raw-hash>`; `hash_len` is the raw hash width in bytes
+/// (20 for SHA-1, 32 for SHA-256).
+fn count_tree_entries(payload: &[u8], hash_len: usize) -> u64 {
+    if hash_len == 0 {
+        return 0;
+    }
+    let mut pos = 0usize;
+    let mut count = 0u64;
+    while pos < payload.len() {
+        match payload[pos..].iter().position(|&b| b == 0) {
+            Some(rel) => {
+                pos += rel + 1 + hash_len;
+                count += 1;
+            }
+            None => break,
+        }
+    }
+    count
+}
+
+fn gather_head_checkout_metrics(repo: &Path, metrics: &mut RepositoryMetrics) -> io::Result<()> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["ls-tree", "-r", "-z", "--long", "HEAD"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let mut directories: HashSet<String> = HashSet::new();
+    let mut directory_entries: HashMap<String, usize> = HashMap::new();
+    let mut longest_path: Option<PathStat> = None;
+
+    for record in output.stdout.split(|&b| b == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(tab_pos) = record.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let meta = String::from_utf8_lossy(&record[..tab_pos]);
+        let path = String::from_utf8_lossy(&record[tab_pos + 1..]).to_string();
+        let mut parts = meta.split_whitespace();
+        let mode = parts.next().unwrap_or("");
+        let kind = parts.next().unwrap_or("");
+        let _oid = parts.next();
+        let size = parts.next().unwrap_or("");
+
+        if mode == "160000" || kind == "commit" {
+            metrics.checkout_submodules += 1;
+            continue;
+        }
+        if mode == "120000" {
+            metrics.checkout_symlinks += 1;
+        }
+        if kind == "blob" {
+            metrics.checkout_files += 1;
+            if let Ok(size) = size.parse::<u64>() {
+                metrics.checkout_total_size_bytes =
+                    metrics.checkout_total_size_bytes.saturating_add(size);
+            }
+        }
+
+        let path_len = path.len();
+        if longest_path
+            .as_ref()
+            .is_none_or(|current| path_len > current.length)
+        {
+            longest_path = Some(PathStat {
+                path: path.clone(),
+                length: path_len,
+            });
+        }
+
+        let components: Vec<&str> = path.split('/').collect();
+        metrics.checkout_max_path_depth = metrics.checkout_max_path_depth.max(components.len());
+        if components.len() > 1 {
+            let mut prefix = String::new();
+            for component in &components[..components.len() - 1] {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(component);
+                directories.insert(prefix.clone());
+            }
+            let parent = components[..components.len() - 1].join("/");
+            *directory_entries.entry(parent).or_insert(0) += 1;
+        }
+    }
+
+    metrics.checkout_directories = directories.len() as u64;
+    metrics.directory_hotspots = directory_entries
+        .into_iter()
+        .max_by_key(|(_, entries)| *entries)
+        .map(|(path, entries)| DirectoryStat { path, entries });
+    metrics.longest_path = longest_path;
     Ok(())
 }
 
@@ -582,201 +867,6 @@ fn gather_refs(repo: &Path, metrics: &mut RepositoryMetrics) -> io::Result<()> {
             metrics.refs_other += 1;
         }
     }
-    Ok(())
-}
-
-// History-wide metrics via single rev-list | diff-tree pipeline
-fn gather_all_blob_sizes(repo: &Path) -> io::Result<(HashMap<String, u64>, HashMap<String, u64>)> {
-    let start_time = Instant::now();
-    let (mut reader, mut child) = run_git_capture_stream(
-        repo,
-        &[
-            "cat-file",
-            "--batch-check=%(objectname) %(objecttype) %(objectsize) %(objectsize:disk)",
-            "--batch-all-objects",
-        ],
-    )?;
-
-    // Pre-allocate with reasonable capacity based on typical repository size.
-    let mut unpacked_size = HashMap::with_capacity(100_000);
-    let mut packed_size = HashMap::with_capacity(100_000);
-    let mut blob_count = 0usize;
-    let mut processed_objects = 0usize;
-    let mut progress_output_enabled = true;
-    let mut line_buf = String::new();
-
-    while reader.read_line(&mut line_buf)? > 0 {
-        let trimmed = line_buf.trim();
-        if !trimmed.is_empty() {
-            let mut parts_iter = trimmed.split_whitespace();
-            if let (Some(sha), Some(objtype), Some(objsize_str), Some(objdisksize_str)) = (
-                parts_iter.next(),
-                parts_iter.next(),
-                parts_iter.next(),
-                parts_iter.next(),
-            ) {
-                if objtype == "blob" {
-                    if let (Ok(objsize), Ok(objdisksize)) =
-                        (objsize_str.parse::<u64>(), objdisksize_str.parse::<u64>())
-                    {
-                        unpacked_size.insert(sha.to_string(), objsize);
-                        packed_size.insert(sha.to_string(), objdisksize);
-                        blob_count += 1;
-                    }
-                }
-            }
-            processed_objects += 1;
-
-            // Keep lightweight progress reporting without requiring full output buffering.
-            if progress_output_enabled && processed_objects.is_multiple_of(1000) {
-                let elapsed = start_time.elapsed();
-                let rate = if elapsed.as_secs_f64() > 0.0 {
-                    processed_objects as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-                progress_output_enabled = write_progress_stdout(format_args!(
-                    "\r[*] Processing objects {} {} ({:.0}/s)",
-                    processed_objects,
-                    format_elapsed(elapsed),
-                    rate
-                ))?;
-            }
-        }
-        line_buf.clear();
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "git cat-file --batch-all-objects failed: {}",
-            status
-        )));
-    }
-
-    if processed_objects > 0 && progress_output_enabled {
-        let elapsed = start_time.elapsed();
-        let rate = if elapsed.as_secs_f64() > 0.0 {
-            processed_objects as f64 / elapsed.as_secs_f64()
-        } else {
-            0.0
-        };
-        let _ = write_progress_stdout(format_args!(
-            "\r[*] Processing objects {} {} ({:.0}/s)\n",
-            processed_objects,
-            format_elapsed(elapsed),
-            rate
-        ))?;
-    }
-
-    eprintln!(
-        "[*] Found {} blobs out of {} total objects",
-        blob_count, processed_objects
-    );
-    Ok((unpacked_size, packed_size))
-}
-
-fn gather_commit_history(repo: &Path, stats: &mut StatsCollection) -> io::Result<()> {
-    // Use streaming approach: process all commits in a single git log command
-    // This is more efficient than batched --skip approach which is O(n²)
-    eprintln_color(Color::Cyan, "[*] Gathering commit history (streaming)...");
-
-    // Get total commit count first
-    let rev_list_output = run_git_capture(repo, &["rev-list", "--all", "--count"])?;
-    let total_commits = rev_list_output
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Could not parse commit count"))?;
-
-    // Stream commit data in a single pass
-    let (mut reader, mut child) = run_git_capture_stream(
-        repo,
-        &[
-            "log",
-            "--all",
-            "--pretty=format:%H %P",
-            "--name-status",
-            "--no-renames",
-        ],
-    )?;
-
-    let mut line_buf = String::new();
-    let mut processed: usize = 0;
-    let mut commit_data: Vec<String> = Vec::new();
-    let mut progress_output_enabled = true;
-
-    while reader.read_line(&mut line_buf)? > 0 {
-        let line = line_buf.trim_end();
-        if line.is_empty() {
-            // End of commit block, process accumulated data
-            if !commit_data.is_empty() {
-                process_commit_block(&commit_data, stats)?;
-                commit_data.clear();
-                processed += 1;
-
-                // Progress indicator every 1000 commits
-                if progress_output_enabled && processed.is_multiple_of(1000) {
-                    let progress = ((processed as f64 / total_commits as f64) * 100.0) as u32;
-                    let bar_length = 30;
-                    let filled = progress as usize * bar_length / 100;
-                    let bar: String = (0..bar_length)
-                        .map(|i| if i < filled { '=' } else { ' ' })
-                        .collect();
-                    progress_output_enabled = write_progress_stdout(format_args!(
-                        "\r[*] Processing commits [{}] {}% ({}/{})",
-                        bar, progress, processed, total_commits
-                    ))?;
-                }
-            }
-        } else {
-            commit_data.push(line.to_string());
-        }
-        line_buf.clear();
-    }
-
-    // Process last commit if exists
-    if !commit_data.is_empty() {
-        process_commit_block(&commit_data, stats)?;
-    }
-
-    // Wait for git command to complete
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "git log --all failed: {}",
-            status
-        )));
-    }
-
-    // Clear progress line and show final result
-    if progress_output_enabled {
-        let _ = write_progress_stdout(format_args!("\n"))?;
-    }
-    stats.num_commits = total_commits as u64;
-    eprintln!(
-        "[*] Commit processing completed. Total: {}",
-        stats.num_commits
-    );
-    Ok(())
-}
-
-/// Process a single commit block from git log output
-fn process_commit_block(commit_data: &[String], stats: &mut StatsCollection) -> io::Result<()> {
-    if commit_data.is_empty() {
-        return Ok(());
-    }
-
-    let first_line = &commit_data[0];
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.is_empty() {
-        return Ok(());
-    }
-
-    let parent_count = parts.len().saturating_sub(1);
-    if stats.max_parents < parent_count {
-        stats.max_parents = parent_count;
-    }
-
     Ok(())
 }
 
@@ -995,31 +1085,56 @@ fn evaluate_warnings(metrics: &RepositoryMetrics, thresholds: &AnalyzeThresholds
     warnings
 }
 
-fn print_human(report: &AnalysisReport, _cfg: &AnalyzeConfig) {
+fn print_human(report: &AnalysisReport, cfg: &AnalyzeConfig) {
     println!("{}", banner("Repository analysis"));
     if let Some(path) = &report.metrics.workdir {
         println!("{}", path);
     }
-    // Unified summary table (without concern column)
+
     print_section("Repository summary");
-    let rows = build_summary_rows(&report.metrics);
+    let rows = build_summary_rows(report, cfg);
     print_table(
         &[
             ("Name", CellAlignment::Left),
             ("Value", CellAlignment::Right),
+            ("Concern", CellAlignment::Center),
         ],
         rows,
     );
 
-    // (Checkout (HEAD) moved near Warnings for better layout)
+    print_section("Object types");
+    print_table(
+        &[
+            ("Type", CellAlignment::Left),
+            ("Count", CellAlignment::Right),
+            ("Total", CellAlignment::Right),
+            ("Max", CellAlignment::Right),
+            ("Concern", CellAlignment::Center),
+        ],
+        build_object_type_rows(&report.metrics, cfg),
+    );
+
+    let checkout_rows = build_checkout_rows(&report.metrics, cfg);
+    if !checkout_rows.is_empty() {
+        print_section("Checkout (HEAD)");
+        print_table(
+            &[
+                ("Metric", CellAlignment::Left),
+                ("Value", CellAlignment::Left),
+                ("Details", CellAlignment::Left),
+                ("Concern", CellAlignment::Center),
+            ],
+            checkout_rows,
+        );
+    }
 
     // Show largest files (unique files, grouped by path) instead of individual blob versions
     if !report.metrics.largest_files.is_empty() {
         println!(
-            "  Top {} files by size:",
+            "Top {} files by size:",
             format_count(report.metrics.largest_files.len() as u64)
         );
-        let rows = report
+        let rows: Vec<Vec<Cow<'_, str>>> = report
             .metrics
             .largest_files
             .iter()
@@ -1028,7 +1143,7 @@ fn print_human(report: &AnalysisReport, _cfg: &AnalyzeConfig) {
                 let truncated_oid = format!("{:.8}", file.largest_oid);
                 vec![
                     Cow::Owned(format!("{}", idx + 1)),
-                    Cow::Owned(format!("{:.2} MiB", to_mib(file.size))),
+                    Cow::Owned(format_bytes(file.size)),
                     Cow::Owned(file.path.clone()),
                     Cow::Owned(format!("{} ver", file.versions)),
                     Cow::Owned(truncated_oid),
@@ -1046,12 +1161,45 @@ fn print_human(report: &AnalysisReport, _cfg: &AnalyzeConfig) {
             rows,
         );
     }
+    if !report.metrics.largest_blobs.is_empty() {
+        println!(
+            "Top {} blobs by size:",
+            format_count(report.metrics.largest_blobs.len() as u64)
+        );
+        let rows: Vec<Vec<Cow<'_, str>>> = report
+            .metrics
+            .largest_blobs
+            .iter()
+            .enumerate()
+            .map(|(idx, blob)| {
+                vec![
+                    Cow::Owned(format!("{}", idx + 1)),
+                    Cow::Owned(format_bytes(blob.size)),
+                    Cow::Owned(blob.path.clone().unwrap_or_default()),
+                    Cow::Owned(format!("{:.8}", blob.oid)),
+                    Cow::Borrowed(
+                        concern_for_warn_u64(blob.size, cfg.thresholds.warn_blob_bytes).label(),
+                    ),
+                ]
+            })
+            .collect();
+        print_table(
+            &[
+                ("#", CellAlignment::Right),
+                ("Size", CellAlignment::Right),
+                ("Path", CellAlignment::Left),
+                ("OID", CellAlignment::Center),
+                ("Concern", CellAlignment::Center),
+            ],
+            rows,
+        );
+    }
     if !report.metrics.largest_trees.is_empty() {
         println!(
-            "  Top {} trees by size:",
+            "Top {} trees by size:",
             format_count(report.metrics.largest_trees.len() as u64)
         );
-        let rows = report
+        let rows: Vec<Vec<Cow<'_, str>>> = report
             .metrics
             .largest_trees
             .iter()
@@ -1060,7 +1208,7 @@ fn print_human(report: &AnalysisReport, _cfg: &AnalyzeConfig) {
                 let truncated_oid = format!("{:.8}", tree.oid);
                 vec![
                     Cow::Owned(format!("{}", idx + 1)),
-                    Cow::Owned(format!("{:.2} KiB", tree.size as f64 / 1024.0)),
+                    Cow::Owned(format_bytes(tree.size)),
                     Cow::Owned(truncated_oid),
                 ]
             })
@@ -1070,14 +1218,20 @@ fn print_human(report: &AnalysisReport, _cfg: &AnalyzeConfig) {
                 ("#", CellAlignment::Right),
                 ("Size", CellAlignment::Right),
                 ("OID", CellAlignment::Center),
+                ("Concern", CellAlignment::Center),
             ],
-            rows,
+            rows.into_iter()
+                .map(|mut row: Vec<Cow<'_, str>>| {
+                    row.push(Cow::Borrowed("Info"));
+                    row
+                })
+                .collect(),
         );
     }
 
     // History oddities are summarized above; keep oversized messages as a list
     if !report.metrics.oversized_commit_messages.is_empty() {
-        println!("  Oversized commit messages:");
+        println!("Oversized commit messages:");
         let rows = report
             .metrics
             .oversized_commit_messages
@@ -1089,6 +1243,10 @@ fn print_human(report: &AnalysisReport, _cfg: &AnalyzeConfig) {
                     Cow::Owned(format!("{}", idx + 1)),
                     Cow::Owned(format_count(msg.length as u64)),
                     Cow::Owned(truncated_oid),
+                    Cow::Borrowed(
+                        concern_for_warn_usize(msg.length, cfg.thresholds.warn_commit_msg_bytes)
+                            .label(),
+                    ),
                 ]
             })
             .collect();
@@ -1097,112 +1255,11 @@ fn print_human(report: &AnalysisReport, _cfg: &AnalyzeConfig) {
                 ("#", CellAlignment::Right),
                 ("Bytes", CellAlignment::Right),
                 ("OID", CellAlignment::Center),
+                ("Concern", CellAlignment::Center),
             ],
             rows,
         );
     }
-
-    // Show checkout (HEAD) details just before Warnings
-    let mut snapshot_rows: Vec<Vec<Cow<'_, str>>> = Vec::new();
-    if let Some(dir) = &report.metrics.directory_hotspots {
-        snapshot_rows.push(vec![
-            Cow::Borrowed("Busiest directory"),
-            Cow::Borrowed(dir.path.as_str()),
-            Cow::Owned(format!("{} entries", format_count(dir.entries as u64))),
-        ]);
-    }
-    if let Some(path) = &report.metrics.longest_path {
-        snapshot_rows.push(vec![
-            Cow::Borrowed("Max path length"),
-            Cow::Borrowed(path.path.as_str()),
-            Cow::Owned(format!("{} chars", format_count(path.length as u64))),
-        ]);
-    }
-    if !snapshot_rows.is_empty() {
-        print_section("Checkout (HEAD)");
-        print_table(
-            &[
-                ("Metric", CellAlignment::Left),
-                ("Value", CellAlignment::Left),
-                ("Details", CellAlignment::Left),
-            ],
-            snapshot_rows,
-        );
-    }
-
-    print_section("Warnings");
-    let warning_rows = report
-        .warnings
-        .iter()
-        .map(|warning| {
-            let (msg, _maybe_ref) = humanize_warning_message(&warning.message, report);
-            vec![
-                Cow::Owned(format!("{:?}", warning.level)),
-                Cow::Owned(msg),
-                warning
-                    .recommendation
-                    .as_deref()
-                    .map(Cow::Borrowed)
-                    .unwrap_or(Cow::Borrowed("")),
-            ]
-        })
-        .collect();
-    print_table(
-        &[
-            ("Level", CellAlignment::Center),
-            ("Message", CellAlignment::Left),
-            ("Recommendation", CellAlignment::Left),
-        ],
-        warning_rows,
-    );
-}
-
-// Attempt to replace OID in a known-warning message pattern with a footnote marker.
-fn humanize_warning_message(message: &str, report: &AnalysisReport) -> (String, Option<String>) {
-    // Patterns handled:
-    // - "Blob <40-hex> is ..."
-    // - "Blob <40-hex> appears ..."
-    // - "Commit <40-hex> has ..."
-    let mut parts = message.split_whitespace();
-    let first = parts.next().unwrap_or("");
-    let second = parts.next().unwrap_or("");
-    if first == "Blob" && is_hex_40(second) {
-        let ctx = find_blob_context(&report.metrics, second);
-        let truncated = format!("{:.8}", second);
-        return (
-            format!("Blob {} ({})", truncated, ctx.unwrap_or_default()),
-            Some(truncated),
-        );
-    }
-    if first == "Commit" && is_hex_40(second) {
-        let truncated = format!("{:.8}", second);
-        return (format!("Commit {}", truncated), Some(truncated));
-    }
-    (message.to_string(), None)
-}
-
-fn is_hex_40(s: &str) -> bool {
-    if s.len() != 40 {
-        return false;
-    }
-    s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn find_blob_context(metrics: &RepositoryMetrics, oid: &str) -> Option<String> {
-    // Prefer example path if present
-    metrics
-        .blobs_over_threshold
-        .iter()
-        .find(|b| b.oid == oid)
-        .and_then(|b| b.path.as_ref())
-        .or_else(|| {
-            metrics
-                .largest_blobs
-                .iter()
-                .find(|b| b.oid == oid)
-                .and_then(|b| b.path.as_ref())
-        })
-        .cloned()
 }
 
 fn run_git_capture(repo: &Path, args: &[&str]) -> io::Result<String> {
@@ -1242,19 +1299,10 @@ fn run_git_capture_stream(
     Ok((BufReader::new(stdout), cmd))
 }
 
+#[cfg(test)]
 fn flush_progress_writer<W: Write>(writer: &mut W) -> io::Result<bool> {
     match writer.flush() {
         Ok(()) => Ok(true),
-        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-fn write_progress_stdout(args: std::fmt::Arguments<'_>) -> io::Result<bool> {
-    // Progress belongs on stderr so machine-readable stdout (e.g. --analyze-json) stays clean.
-    let mut stderr = io::stderr();
-    match stderr.write_fmt(args) {
-        Ok(()) => flush_progress_writer(&mut stderr),
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(false),
         Err(err) => Err(err),
     }
@@ -1289,8 +1337,7 @@ fn heap_to_object_stats_with_paths(
 
 fn compute_largest_files(
     blob_paths: &HashMap<String, Vec<String>>,
-    unpacked_size: &HashMap<String, u64>,
-    packed_size: &HashMap<String, u64>,
+    object_sizes: &HashMap<String, u64>,
     top: usize,
 ) -> Vec<FileStat> {
     if top == 0 {
@@ -1300,10 +1347,7 @@ fn compute_largest_files(
     let mut file_map: HashMap<String, (u64, String, usize)> = HashMap::new();
 
     for (oid, paths) in blob_paths {
-        let size = unpacked_size
-            .get(oid)
-            .copied()
-            .unwrap_or_else(|| packed_size.get(oid).copied().unwrap_or(0));
+        let size = object_sizes.get(oid).copied().unwrap_or(0);
 
         for path in paths {
             let entry = file_map.entry(path.clone()).or_insert((0, oid.clone(), 0));
@@ -1346,13 +1390,21 @@ fn push_top(heap: &mut BinaryHeap<Reverse<(u64, String)>>, limit: usize, size: u
 }
 
 fn banner(title: &str) -> String {
-    let banner = format!("{:=^64}", format!(" {} ", title));
+    let banner = format!(
+        "{:=^width$}",
+        format!(" {} ", title),
+        width = render_width()
+    );
     styled_text(&banner, Color::Cyan, true, stdout_supports_color())
 }
 
 fn print_section(title: &str) {
     println!();
-    let section = format!("{:-^64}", format!(" {} ", title));
+    let section = format!(
+        "{:-^width$}",
+        format!(" {} ", title),
+        width = render_width()
+    );
     println!(
         "{}",
         styled_text(&section, Color::Cyan, true, stdout_supports_color())
@@ -1364,9 +1416,14 @@ fn print_table(headers: &[(&str, CellAlignment)], rows: Vec<Vec<Cow<'_, str>>>) 
         return;
     }
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-    table.apply_modifier(UTF8_ROUND_CORNERS);
+    if stdout_prefers_utf8() {
+        table.load_preset(UTF8_FULL);
+        table.apply_modifier(UTF8_ROUND_CORNERS);
+    } else {
+        table.load_preset(ASCII_FULL);
+    }
     table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_width(render_width() as u16);
 
     let header_cells = headers
         .iter()
@@ -1388,8 +1445,31 @@ fn print_table(headers: &[(&str, CellAlignment)], rows: Vec<Vec<Cow<'_, str>>>) 
     }
 
     for line in table.to_string().lines() {
-        println!("  {}", line);
+        println!("{}", line);
     }
+}
+
+fn render_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width >= 40)
+        .unwrap_or(80)
+        .min(120)
+}
+
+fn stdout_prefers_utf8() -> bool {
+    use std::io::IsTerminal;
+
+    if !io::stdout().is_terminal() {
+        return false;
+    }
+    let locale = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LC_CTYPE"))
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    locale.contains("UTF-8") || locale.contains("UTF8")
 }
 
 fn format_count<T: Into<u64>>(value: T) -> String {
@@ -1404,126 +1484,289 @@ fn format_count<T: Into<u64>>(value: T) -> String {
     out.chars().rev().collect()
 }
 
-fn format_elapsed(duration: std::time::Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{:.1}s", secs as f64 + duration.subsec_nanos() as f64 / 1e9)
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
+/// Render a byte count with an adaptive binary unit so small objects (commits,
+/// trees, tags) are not all flattened to `0.00 MiB`.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.2} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.2} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.2} KiB", value / KIB)
     } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        format!("{} B", bytes)
     }
 }
 
-fn format_size_gib(bytes: u64) -> String {
-    format!("{:.2} GiB", to_gib(bytes))
-}
-
-fn build_summary_rows(metrics: &RepositoryMetrics) -> Vec<Vec<Cow<'_, str>>> {
+fn build_summary_rows<'a>(
+    report: &'a AnalysisReport,
+    cfg: &AnalyzeConfig,
+) -> Vec<Vec<Cow<'a, str>>> {
+    let metrics = &report.metrics;
     let mut rows: Vec<Vec<Cow<'_, str>>> = Vec::new();
+    let thresholds = &cfg.thresholds;
 
-    // Overall repository size
+    let highest = worst_human_concern(&report.warnings);
     rows.push(vec![
-        Cow::Borrowed("Overall repository size"),
-        Cow::Borrowed(""),
+        Cow::Borrowed("Highest concern"),
+        Cow::Borrowed(highest.label()),
+        Cow::Borrowed(highest.label()),
     ]);
-    // * Total objects
     rows.push(vec![
-        Cow::Borrowed("  * Total objects"),
+        Cow::Borrowed("Reachable objects"),
         Cow::Owned(format_count(metrics.total_objects)),
+        Cow::Borrowed(
+            concern_for_warn_usize(metrics.total_objects as usize, thresholds.warn_object_count)
+                .label(),
+        ),
     ]);
-    // * Total size
     rows.push(vec![
-        Cow::Borrowed("  * Total size"),
-        Cow::Owned(format_size_gib(metrics.total_size_bytes)),
+        Cow::Borrowed("Reachable object size"),
+        Cow::Owned(format_bytes(metrics.total_size_bytes)),
+        Cow::Borrowed(
+            concern_for_warn_crit_u64(
+                metrics.total_size_bytes,
+                thresholds.warn_total_bytes,
+                thresholds.crit_total_bytes,
+            )
+            .label(),
+        ),
     ]);
-    // * Loose objects
     rows.push(vec![
-        Cow::Borrowed("  * Loose objects"),
+        Cow::Borrowed("Physical loose objects"),
         Cow::Owned(format!(
-            "{} ({:.2} MiB)",
+            "{} ({})",
             format_count(metrics.loose_objects),
-            to_mib(metrics.loose_size_bytes)
+            format_bytes(metrics.loose_size_bytes)
         )),
+        Cow::Borrowed("Info"),
     ]);
-    // * Packed objects
     rows.push(vec![
-        Cow::Borrowed("  * Packed objects"),
+        Cow::Borrowed("Physical packed objects"),
         Cow::Owned(format!(
-            "{} ({:.2} MiB)",
+            "{} ({})",
             format_count(metrics.packed_objects),
-            to_mib(metrics.packed_size_bytes)
+            format_bytes(metrics.packed_size_bytes)
         )),
+        Cow::Borrowed("Info"),
     ]);
-
-    // Objects
-    rows.push(vec![Cow::Borrowed("Objects"), Cow::Borrowed("")]);
-    if let Some(count) = metrics.object_types.get("commit") {
-        rows.push(vec![
-            Cow::Borrowed("  * Commits (count)"),
-            Cow::Owned(format_count(*count)),
-        ]);
-    }
-    if let Some(count) = metrics.object_types.get("blob") {
-        rows.push(vec![
-            Cow::Borrowed("  * Blobs (count)"),
-            Cow::Owned(format_count(*count)),
-        ]);
-    }
-
-    // References
-    rows.push(vec![Cow::Borrowed("References"), Cow::Borrowed("")]);
     rows.push(vec![
-        Cow::Borrowed("  * Total"),
+        Cow::Borrowed("Refs"),
         Cow::Owned(format_count(metrics.refs_total as u64)),
+        Cow::Borrowed(
+            concern_for_warn_usize(metrics.refs_total, thresholds.warn_ref_count).label(),
+        ),
     ]);
     rows.push(vec![
-        Cow::Borrowed("  * Heads"),
-        Cow::Owned(format_count(metrics.refs_heads as u64)),
-    ]);
-    rows.push(vec![
-        Cow::Borrowed("  * Tags"),
-        Cow::Owned(format_count(metrics.refs_tags as u64)),
-    ]);
-    rows.push(vec![
-        Cow::Borrowed("  * Remotes"),
-        Cow::Owned(format_count(metrics.refs_remotes as u64)),
-    ]);
-    rows.push(vec![
-        Cow::Borrowed("  * Other"),
-        Cow::Owned(format_count(metrics.refs_other as u64)),
-    ]);
-
-    // History structure
-    rows.push(vec![Cow::Borrowed("History"), Cow::Borrowed("")]);
-    rows.push(vec![
-        Cow::Borrowed("  * Max parents"),
+        Cow::Borrowed("Max commit parents"),
         Cow::Owned(format_count(metrics.max_commit_parents as u64)),
+        Cow::Borrowed(
+            concern_for_warn_usize(metrics.max_commit_parents, thresholds.warn_max_parents).label(),
+        ),
     ]);
-
-    // Trees
-    rows.push(vec![Cow::Borrowed("Trees"), Cow::Borrowed("")]);
-    if let Some(count) = metrics.object_types.get("tree") {
-        rows.push(vec![
-            Cow::Borrowed("  * Trees (count)"),
-            Cow::Owned(format_count(*count)),
-        ]);
-    }
     rows.push(vec![
-        Cow::Borrowed("  * Trees total size"),
-        Cow::Owned(format!("{:.2} GiB", to_gib(metrics.tree_total_size_bytes))),
+        Cow::Borrowed("Total tree entries"),
+        Cow::Owned(format_count(metrics.total_tree_entries)),
+        Cow::Borrowed(
+            metrics
+                .max_tree_entries
+                .as_ref()
+                .map(|tree| concern_for_warn_usize(tree.entries, thresholds.warn_tree_entries))
+                .unwrap_or(Concern::Ok)
+                .label(),
+        ),
     ]);
 
     rows
+}
+
+fn build_object_type_rows(
+    metrics: &RepositoryMetrics,
+    cfg: &AnalyzeConfig,
+) -> Vec<Vec<Cow<'static, str>>> {
+    ["commit", "tree", "blob", "tag"]
+        .into_iter()
+        .filter_map(|kind| {
+            let count = metrics.object_types.get(kind).copied().unwrap_or(0);
+            if count == 0 {
+                return None;
+            }
+            let total = metrics.object_type_sizes.get(kind).copied().unwrap_or(0);
+            let max = max_object_size(metrics, kind);
+            let concern = match kind {
+                "blob" => concern_for_warn_u64(max, cfg.thresholds.warn_blob_bytes),
+                _ => Concern::Info,
+            };
+            Some(vec![
+                Cow::Owned(kind.to_string()),
+                Cow::Owned(format_count(count)),
+                Cow::Owned(format_bytes(total)),
+                Cow::Owned(format_bytes(max)),
+                Cow::Borrowed(concern.label()),
+            ])
+        })
+        .collect()
+}
+
+fn build_checkout_rows<'a>(
+    metrics: &'a RepositoryMetrics,
+    cfg: &AnalyzeConfig,
+) -> Vec<Vec<Cow<'a, str>>> {
+    let mut rows = vec![
+        vec![
+            Cow::Borrowed("Files"),
+            Cow::Owned(format_count(metrics.checkout_files)),
+            Cow::Owned(format_bytes(metrics.checkout_total_size_bytes)),
+            Cow::Borrowed("Info"),
+        ],
+        vec![
+            Cow::Borrowed("Directories"),
+            Cow::Owned(format_count(metrics.checkout_directories)),
+            Cow::Borrowed(""),
+            Cow::Borrowed("Info"),
+        ],
+        vec![
+            Cow::Borrowed("Max path depth"),
+            Cow::Owned(format_count(metrics.checkout_max_path_depth as u64)),
+            Cow::Borrowed("components"),
+            Cow::Borrowed("Info"),
+        ],
+    ];
+    if metrics.checkout_symlinks > 0 {
+        rows.push(vec![
+            Cow::Borrowed("Symlinks"),
+            Cow::Owned(format_count(metrics.checkout_symlinks)),
+            Cow::Borrowed(""),
+            Cow::Borrowed("Info"),
+        ]);
+    }
+    if metrics.checkout_submodules > 0 {
+        rows.push(vec![
+            Cow::Borrowed("Submodules"),
+            Cow::Owned(format_count(metrics.checkout_submodules)),
+            Cow::Borrowed(""),
+            Cow::Borrowed("Info"),
+        ]);
+    }
+    if let Some(dir) = &metrics.directory_hotspots {
+        rows.push(vec![
+            Cow::Borrowed("Busiest directory"),
+            Cow::Borrowed(dir.path.as_str()),
+            Cow::Owned(format!("{} entries", format_count(dir.entries as u64))),
+            Cow::Borrowed(
+                concern_for_warn_usize(dir.entries, cfg.thresholds.warn_tree_entries).label(),
+            ),
+        ]);
+    }
+    if let Some(path) = &metrics.longest_path {
+        rows.push(vec![
+            Cow::Borrowed("Max path length"),
+            Cow::Borrowed(path.path.as_str()),
+            Cow::Owned(format!("{} chars", format_count(path.length as u64))),
+            Cow::Borrowed(
+                concern_for_warn_usize(path.length, cfg.thresholds.warn_path_length).label(),
+            ),
+        ]);
+    }
+    rows
+}
+
+fn max_object_size(metrics: &RepositoryMetrics, kind: &str) -> u64 {
+    let objects = match kind {
+        "commit" => &metrics.largest_commits,
+        "tree" => &metrics.largest_trees,
+        "blob" => &metrics.largest_blobs,
+        "tag" => &metrics.largest_tags,
+        _ => return 0,
+    };
+    objects.iter().map(|object| object.size).max().unwrap_or(0)
+}
+
+fn worst_human_concern(warnings: &[Warning]) -> Concern {
+    warnings
+        .iter()
+        .filter(|warning| !warning.message.starts_with("No size-related issues"))
+        .map(|warning| match warning.level {
+            WarningLevel::Info => Concern::Info,
+            WarningLevel::Warning => Concern::Warning,
+            WarningLevel::Critical => Concern::Critical,
+        })
+        .max()
+        .unwrap_or(Concern::Ok)
+}
+
+fn concern_for_warn_usize(value: usize, warn: usize) -> Concern {
+    if warn > 0 && value >= warn {
+        Concern::Warning
+    } else {
+        Concern::Ok
+    }
+}
+
+fn concern_for_warn_u64(value: u64, warn: u64) -> Concern {
+    if warn > 0 && value >= warn {
+        Concern::Warning
+    } else {
+        Concern::Ok
+    }
+}
+
+fn concern_for_warn_crit_u64(value: u64, warn: u64, critical: u64) -> Concern {
+    if critical > 0 && value >= critical {
+        Concern::Critical
+    } else {
+        concern_for_warn_u64(value, warn)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         collect_blob_sizes_from_reader, collect_oversized_commit_messages_from_reader,
-        color_output_enabled, flush_progress_writer,
+        color_output_enabled, count_tree_entries, flush_progress_writer, format_bytes,
     };
     use std::io::{Cursor, ErrorKind, Write};
+
+    fn sha1_tree_entry(mode: &str, name: &str, hash: [u8; 20]) -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(mode.as_bytes());
+        entry.push(b' ');
+        entry.extend_from_slice(name.as_bytes());
+        entry.push(0);
+        entry.extend_from_slice(&hash);
+        entry
+    }
+
+    #[test]
+    fn count_tree_entries_ignores_nul_bytes_inside_hashes() {
+        // Two entries whose raw SHA-1 values both contain 0x00 bytes; a naive
+        // NUL-byte count would overcount, the structured walk must return 2.
+        let mut payload = Vec::new();
+        payload.extend(sha1_tree_entry("100644", "a.txt", [0u8; 20]));
+        let mut hash = [0xABu8; 20];
+        hash[3] = 0x00;
+        hash[9] = 0x00;
+        payload.extend(sha1_tree_entry("100644", "b.txt", hash));
+
+        assert_eq!(count_tree_entries(&payload, 20), 2);
+    }
+
+    #[test]
+    fn count_tree_entries_handles_empty_payload_and_zero_hash_len() {
+        assert_eq!(count_tree_entries(&[], 20), 0);
+        assert_eq!(count_tree_entries(&[1, 2, 3], 0), 0);
+    }
+
+    #[test]
+    fn format_bytes_scales_units() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.00 KiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.00 MiB");
+    }
 
     struct ErrorWriter {
         kind: ErrorKind,

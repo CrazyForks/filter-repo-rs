@@ -52,8 +52,8 @@ fn docs_example_config_runs_under_debug_mode() {
         stdout
     );
     assert!(
-        stdout.contains("Total size"),
-        "expected total size summary in analysis output: {}",
+        stdout.contains("Reachable object size"),
+        "expected reachable size summary in analysis output: {}",
         stdout
     );
     let stderr = String::from_utf8_lossy(&output.stderr);

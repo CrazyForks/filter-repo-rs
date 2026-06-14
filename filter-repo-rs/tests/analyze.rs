@@ -424,6 +424,11 @@ fn analyze_report_excludes_unreachable_blobs_from_top_lists() {
     opts.analyze.thresholds.warn_blob_bytes = 1;
 
     let report = fr::analysis::generate_report(&opts).expect("generate analysis report");
+    let reachable_object_count = rev_list.lines().count() as u64;
+    assert_eq!(
+        report.metrics.total_objects, reachable_object_count,
+        "headline total_objects should use the reachable object universe"
+    );
     assert!(
         report
             .metrics
@@ -443,6 +448,70 @@ fn analyze_report_excludes_unreachable_blobs_from_top_lists() {
         "blobs_over_threshold should not include unreachable oid {}: {:?}",
         unreachable_oid,
         report.metrics.blobs_over_threshold
+    );
+}
+
+#[test]
+fn analyze_report_populates_reachable_tree_tag_and_checkout_metrics() {
+    let repo = init_repo();
+    write_file(&repo, "src/deep/module/file.txt", "reachable payload\n");
+    write_file(
+        &repo,
+        "src/deep/module/another.txt",
+        "another reachable payload\n",
+    );
+    write_file(&repo, "assets/images/logo.txt", "logo payload\n");
+    assert_eq!(run_git(&repo, &["add", "."]).0, 0);
+    assert_eq!(
+        run_git(&repo, &["commit", "-m", "seed reachable metrics"]).0,
+        0
+    );
+    assert_eq!(
+        run_git(&repo, &["tag", "-a", "v1", "-m", "annotated tag"]).0,
+        0
+    );
+
+    let opts = fr::Options {
+        source: repo.clone(),
+        target: repo.clone(),
+        mode: fr::Mode::Analyze,
+        force: true,
+        ..Default::default()
+    };
+
+    let report = fr::analysis::generate_report(&opts).expect("generate analysis report");
+
+    assert!(
+        report
+            .metrics
+            .object_types
+            .get("tree")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "tree count should reflect reachable trees: {:?}",
+        report.metrics.object_types
+    );
+    assert!(
+        report.metrics.object_types.get("tag").copied().unwrap_or(0) > 0,
+        "tag count should reflect reachable annotated tags: {:?}",
+        report.metrics.object_types
+    );
+    assert!(
+        report.metrics.tree_total_size_bytes > 0,
+        "tree_total_size_bytes should be populated"
+    );
+    assert!(
+        !report.metrics.largest_trees.is_empty(),
+        "largest_trees should be populated"
+    );
+    assert!(
+        report.metrics.directory_hotspots.is_some(),
+        "directory_hotspots should be populated from HEAD"
+    );
+    assert!(
+        report.metrics.longest_path.is_some(),
+        "longest_path should be populated from HEAD"
     );
 }
 
@@ -469,12 +538,20 @@ fn analyze_mode_with_write_report_creates_report_file() {
 
     let content = std::fs::read_to_string(&report_path).expect("read report.txt");
     assert!(
-        content.contains("Repository Analysis Report"),
+        content.contains("Repository analysis"),
         "report should contain header"
     );
     assert!(
-        content.contains("Total objects"),
-        "report should contain metrics"
+        content.contains("Reachable objects"),
+        "report should contain reachable metrics"
+    );
+    assert!(
+        content.contains("Object types"),
+        "report should contain per-type metrics"
+    );
+    assert!(
+        content.contains("Highest concern"),
+        "report should include concern levels"
     );
 }
 
