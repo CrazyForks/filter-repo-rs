@@ -287,6 +287,43 @@ fn analyze_mode_warns_on_commit_thresholds() {
 }
 
 #[test]
+fn analyze_subflags_imply_read_only_analyze_mode() {
+    // `--analyze-top` is an analyze-only option. Used without an explicit
+    // `--analyze`, it must still run a read-only analysis (and therefore never
+    // fall through to the write/rewrite path that is gated by already-ran),
+    // since narrowing the top-N display lists is meaningless for a rewrite.
+    let repo = init_repo();
+    write_file(&repo, "src/a.txt", "a\n");
+    assert_eq!(run_git(&repo, &["add", "."]).0, 0);
+    assert_eq!(
+        run_git(&repo, &["commit", "-m", "seed analyze subflag"]).0,
+        0
+    );
+
+    let output = cli_command()
+        .arg("--analyze-top")
+        .arg("3")
+        .arg("--source")
+        .arg(repo.to_string_lossy().as_ref())
+        .arg("--target")
+        .arg(repo.to_string_lossy().as_ref())
+        .output()
+        .expect("run filter-repo-rs --analyze-top");
+
+    assert!(
+        output.status.success(),
+        "--analyze-top alone should succeed as analysis: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Repository summary"),
+        "expected a read-only analysis report, got: {}",
+        stdout
+    );
+}
+
+#[test]
 fn analyze_json_stdout_is_valid_json_without_progress_prefix() {
     let repo = init_repo();
     write_file(&repo, "src/a.txt", "a\n");

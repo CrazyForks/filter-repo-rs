@@ -133,6 +133,19 @@ impl AnalyzeThresholdOverrides {
         apply_threshold_field!(thresholds, self, warn_commit_msg_bytes);
         apply_threshold_field!(thresholds, self, warn_max_parents);
     }
+
+    fn any_set(&self) -> bool {
+        self.warn_total_bytes.is_some()
+            || self.crit_total_bytes.is_some()
+            || self.warn_blob_bytes.is_some()
+            || self.warn_ref_count.is_some()
+            || self.warn_object_count.is_some()
+            || self.warn_tree_entries.is_some()
+            || self.warn_path_length.is_some()
+            || self.warn_duplicate_paths.is_some()
+            || self.warn_commit_msg_bytes.is_some()
+            || self.warn_max_parents.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -151,6 +164,13 @@ impl AnalyzeOverrides {
             analyze.top = top;
         }
         self.thresholds.apply(&mut analyze.thresholds);
+    }
+
+    /// True when any analyze-only CLI flag was supplied. These options only
+    /// affect read-only analysis output, so their presence implies analyze
+    /// mode rather than a history rewrite.
+    fn any_set(&self) -> bool {
+        self.json.is_some() || self.top.is_some() || self.thresholds.any_set()
     }
 }
 
@@ -924,6 +944,14 @@ pub fn parse_args() -> Result<Options, FilterRepoError> {
             }
             Err(other) => return Err(other),
         }
+    }
+
+    // Analyze-only CLI flags (e.g. --analyze-top, --analyze-json, thresholds)
+    // imply analyze mode: they have no effect on a rewrite, and analysis is a
+    // read-only operation that must not fall through to the write path (which
+    // is gated by already-ran detection).
+    if overrides.any_set() {
+        opts.mode = Mode::Analyze;
     }
 
     overrides.apply(&mut opts.analyze);
