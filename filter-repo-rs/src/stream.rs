@@ -854,6 +854,30 @@ struct BlobPayloadCtx<'a> {
     strip_sha_lookup: &'a StripShaLookup,
 }
 
+/// Write `bytes` to the filtered-stream file (always) and to the fast-import
+/// stdin when present. A `BrokenPipe` on the fast-import side marks the importer
+/// as broken and is swallowed, matching the legacy inline blob-write behavior
+/// (the caller keeps writing the filtered file). Slice-based: never copies the
+/// payload into a temporary buffer.
+fn dual_write<Wf: Write, Wi: Write>(
+    filt: &mut Wf,
+    fi_in: Option<&mut Wi>,
+    import_broken: &mut bool,
+    bytes: &[u8],
+) -> io::Result<()> {
+    filt.write_all(bytes)?;
+    if let Some(fi) = fi_in {
+        if let Err(e) = fi.write_all(bytes) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                *import_broken = true;
+            } else {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn process_blob_data_payload(
     payload: Vec<u8>,
     ctx: &mut BlobPayloadCtx<'_>,
@@ -911,63 +935,38 @@ fn process_blob_data_payload(
     }
 
     for h in ctx.blob_buf.drain(..) {
-        ctx.filt_file.write_all(&h)?;
-        if let Some(ref mut fi_in) = ctx.fi_in_opt {
-            if let Err(e) = fi_in.write_all(&h) {
-                if e.kind() == io::ErrorKind::BrokenPipe {
-                    *ctx.import_broken = true;
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
+        dual_write(ctx.filt_file, ctx.fi_in_opt.as_mut(), ctx.import_broken, &h)?;
     }
     if ctx.content_replacer.is_none() && ctx.content_regex_replacer.is_none() {
         let header = format!("data {}\n", n);
-        ctx.filt_file.write_all(header.as_bytes())?;
-        if let Some(ref mut fi_in) = ctx.fi_in_opt {
-            if let Err(e) = fi_in.write_all(header.as_bytes()) {
-                if e.kind() == io::ErrorKind::BrokenPipe {
-                    *ctx.import_broken = true;
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
-        ctx.filt_file.write_all(&payload)?;
-        if let Some(ref mut fi_in) = ctx.fi_in_opt {
-            if let Err(e) = fi_in.write_all(&payload) {
-                if e.kind() == io::ErrorKind::BrokenPipe {
-                    *ctx.import_broken = true;
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
+        dual_write(
+            ctx.filt_file,
+            ctx.fi_in_opt.as_mut(),
+            ctx.import_broken,
+            header.as_bytes(),
+        )?;
+        dual_write(
+            ctx.filt_file,
+            ctx.fi_in_opt.as_mut(),
+            ctx.import_broken,
+            &payload,
+        )?;
     } else {
         let (new_payload, changed) =
             process_blob_content(payload, ctx.content_replacer, ctx.content_regex_replacer);
         let header = format!("data {}\n", new_payload.len());
-        ctx.filt_file.write_all(header.as_bytes())?;
-        if let Some(ref mut fi_in) = ctx.fi_in_opt {
-            if let Err(e) = fi_in.write_all(header.as_bytes()) {
-                if e.kind() == io::ErrorKind::BrokenPipe {
-                    *ctx.import_broken = true;
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
-        ctx.filt_file.write_all(&new_payload)?;
-        if let Some(ref mut fi_in) = ctx.fi_in_opt {
-            if let Err(e) = fi_in.write_all(&new_payload) {
-                if e.kind() == io::ErrorKind::BrokenPipe {
-                    *ctx.import_broken = true;
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
+        dual_write(
+            ctx.filt_file,
+            ctx.fi_in_opt.as_mut(),
+            ctx.import_broken,
+            header.as_bytes(),
+        )?;
+        dual_write(
+            ctx.filt_file,
+            ctx.fi_in_opt.as_mut(),
+            ctx.import_broken,
+            &new_payload,
+        )?;
         if changed {
             if let Some(m) = *ctx.last_blob_mark {
                 tracker.modified_marks.insert(m);
