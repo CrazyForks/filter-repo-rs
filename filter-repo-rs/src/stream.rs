@@ -1817,10 +1817,14 @@ impl<'a> StreamProcessor<'a> {
                         }
                         last_blob_orig_sha = Some(v);
                         blob_state
-                    } else if let Some(next_state) =
-                        blob_state.clone().record_blob_mark(&current_line)
-                    {
-                        next_state
+                    } else if current_line.starts_with(b"mark :") {
+                        // `record_blob_mark` only matches `mark :` lines. Gate on a
+                        // cheap prefix check so we consume `blob_state` in place
+                        // instead of cloning the whole InBlob (incl.
+                        // header_lines: Vec<Vec<u8>>) on every blob header line.
+                        blob_state
+                            .record_blob_mark(&current_line)
+                            .unwrap_or_else(|| unreachable!("`mark :` line must record"))
                     } else {
                         let ParseState::InBlob {
                             mark,
