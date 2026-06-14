@@ -2,7 +2,6 @@ use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::gitutil::git_dir;
 use crate::opts::Options;
 
 pub fn build_fast_export_cmd(opts: &Options) -> io::Result<Command> {
@@ -107,7 +106,7 @@ pub fn build_fast_export_cmd(opts: &Options) -> io::Result<Command> {
     Ok(cmd)
 }
 
-pub fn build_fast_import_cmd(opts: &Options) -> Command {
+pub fn build_fast_import_cmd(opts: &Options, target_git_dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(&opts.target);
     // Config overrides must precede subcommand
@@ -117,11 +116,11 @@ pub fn build_fast_import_cmd(opts: &Options) -> Command {
     if opts.git_caps.fast_export_anonymize_map {
         cmd.arg("--date-format=raw-permissive");
     }
-    // Export marks so we can build commit-map without in-stream get-mark
-    if let Ok(gd) = git_dir(&opts.target) {
-        let marks_path = Path::new(&gd).join("filter-repo").join("target-marks");
-        cmd.arg(format!("--export-marks={}", marks_path.to_string_lossy()));
-    }
+    // Export marks so we can build commit-map without in-stream get-mark.
+    // The caller passes the already-resolved target git dir to avoid an extra
+    // `git rev-parse --git-dir` spawn.
+    let marks_path = target_git_dir.join("filter-repo").join("target-marks");
+    cmd.arg(format!("--export-marks={}", marks_path.to_string_lossy()));
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
@@ -205,7 +204,8 @@ mod tests {
             },
             ..Options::default()
         };
-        let with_cap = build_fast_import_cmd(&opts);
+        let git_dir = crate::gitutil::git_dir(temp.path()).expect("resolve git dir");
+        let with_cap = build_fast_import_cmd(&opts, &git_dir);
         let args_with = args_as_strings(&with_cap);
         assert!(
             args_with
@@ -216,7 +216,7 @@ mod tests {
 
         let mut opts_without = opts.clone();
         opts_without.git_caps.fast_export_anonymize_map = false;
-        let without_cap = build_fast_import_cmd(&opts_without);
+        let without_cap = build_fast_import_cmd(&opts_without, &git_dir);
         let args_without = args_as_strings(&without_cap);
         assert!(
             !args_without

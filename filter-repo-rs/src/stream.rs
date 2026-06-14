@@ -1204,6 +1204,7 @@ impl Drop for BatchCat {
 
 struct StreamProcessor<'a> {
     opts: &'a Options,
+    target_git_dir: PathBuf,
     debug_dir: PathBuf,
 }
 
@@ -1221,7 +1222,11 @@ impl<'a> StreamProcessor<'a> {
             create_dir_all(&debug_dir)?;
         }
 
-        Ok(Self { opts, debug_dir })
+        Ok(Self {
+            opts,
+            target_git_dir,
+            debug_dir,
+        })
     }
 
     fn init_stream_io(&self) -> io::Result<StreamIo> {
@@ -1245,7 +1250,7 @@ impl<'a> StreamProcessor<'a> {
             None
         } else {
             Some(
-                crate::pipes::build_fast_import_cmd(opts)
+                crate::pipes::build_fast_import_cmd(opts, &self.target_git_dir)
                     .spawn()
                     .map_err(|e| {
                         io::Error::other(format!("failed to spawn git fast-import: {e}"))
