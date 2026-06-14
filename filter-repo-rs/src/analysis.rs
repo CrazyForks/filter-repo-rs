@@ -371,14 +371,7 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
         .count();
     let mut stats = StatsCollection {
         blob_paths: HashMap::with_capacity(estimated_blobs),
-        max_parents: 0,
     };
-
-    // Determine maximum number of parents across all commits
-    eprintln_color(Color::Cyan, "[*] Processing commit history...");
-    if let Ok(maxp) = gather_max_parents(repo) {
-        stats.max_parents = maxp;
-    }
 
     for (oid, paths) in &inventory.paths_by_oid {
         if inventory
@@ -396,8 +389,15 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
 
     // Update metrics from the reachable object universe.
     populate_reachable_object_metrics(&mut metrics, &inventory, cfg);
-    gather_tree_entry_metrics(repo, &inventory, &mut metrics)?;
-    metrics.max_commit_parents = stats.max_parents;
+
+    // One cat-file --batch pass over reachable commits + trees yields max
+    // parents, oversized commit messages, and tree-entry counts together.
+    eprintln_color(Color::Cyan, "[*] Processing commit history...");
+    let history = gather_history_metrics(repo, &inventory, cfg.thresholds.warn_commit_msg_bytes)?;
+    metrics.max_commit_parents = history.max_parents;
+    metrics.total_tree_entries = history.total_tree_entries;
+    metrics.max_tree_entries = history.max_tree_entries;
+    metrics.oversized_commit_messages = history.oversized_commit_messages;
 
     // Find largest blobs and prepare path mappings
     let mut largest_blobs: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
@@ -424,17 +424,12 @@ fn collect_metrics(repo: &Path, cfg: &AnalyzeConfig) -> io::Result<RepositoryMet
     eprintln_color(Color::Cyan, "[*] Analyzing working directory...");
     gather_head_checkout_metrics(repo, &mut metrics)?;
 
-    // Gather oversized commit messages based on configured threshold
-    metrics.oversized_commit_messages =
-        gather_oversized_commit_messages(repo, cfg.thresholds.warn_commit_msg_bytes)?;
-
     eprintln_color(Color::Green, "[*] Analysis complete!");
     Ok(metrics)
 }
 
 struct StatsCollection {
     blob_paths: HashMap<String, Vec<String>>,
-    max_parents: usize,
 }
 
 fn gather_footprint(repo: &Path, metrics: &mut RepositoryMetrics) -> io::Result<()> {
@@ -606,44 +601,34 @@ fn populate_reachable_object_metrics(
     metrics.largest_tags = heap_to_object_stats_with_paths(largest_tags, &inventory.paths_by_oid);
 }
 
-fn gather_tree_entry_metrics(
-    repo: &Path,
-    inventory: &ReachableInventory,
-    metrics: &mut RepositoryMetrics,
-) -> io::Result<()> {
-    let tree_oids: Vec<String> = metrics
-        .object_types
-        .get("tree")
-        .filter(|&&count| count > 0)
-        .map(|_| {
-            inventory
-                .object_types
-                .iter()
-                .filter(|(_, kind)| *kind == "tree")
-                .map(|(oid, _)| oid.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    if tree_oids.is_empty() {
-        return Ok(());
-    }
-
-    let entry_counts = batch_count_tree_entries(repo, tree_oids)?;
-    metrics.total_tree_entries = entry_counts.values().copied().sum();
-    metrics.max_tree_entries = entry_counts
-        .into_iter()
-        .max_by_key(|(_, entries)| *entries)
-        .map(|(oid, entries)| DirectoryStat {
-            path: oid,
-            entries: entries as usize,
-        });
-    Ok(())
+/// History/structure metrics derived from one `cat-file --batch` pass over the
+/// reachable commit and tree objects. Folding commits and trees into a single
+/// pass replaces three separate full-history git invocations (`rev-list
+/// --parents --all`, `git log --all`, and a trees-only `cat-file --batch`).
+#[derive(Debug, Default)]
+struct HistoryMetrics {
+    max_parents: usize,
+    oversized_commit_messages: Vec<CommitMessageStat>,
+    total_tree_entries: u64,
+    max_tree_entries: Option<DirectoryStat>,
 }
 
-fn batch_count_tree_entries(
+fn gather_history_metrics(
     repo: &Path,
-    tree_oids: Vec<String>,
-) -> io::Result<HashMap<String, u64>> {
+    inventory: &ReachableInventory,
+    threshold_bytes: usize,
+) -> io::Result<HistoryMetrics> {
+    let oids: Vec<String> = inventory
+        .object_types
+        .iter()
+        .filter(|(_, kind)| *kind == "commit" || *kind == "tree")
+        .map(|(oid, _)| oid.clone())
+        .collect();
+    let mut result = HistoryMetrics::default();
+    if oids.is_empty() {
+        return Ok(result);
+    }
+
     let mut child = Command::new("git")
         .current_dir(repo)
         .args(["cat-file", "--batch"])
@@ -659,10 +644,10 @@ fn batch_count_tree_entries(
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("failed to capture git cat-file stdout"))?;
-    let writer = spawn_oid_batch_writer(stdin, tree_oids);
+    let writer = spawn_oid_batch_writer(stdin, oids);
     let mut reader = BufReader::new(stdout);
-    let mut counts = HashMap::new();
     let mut header = Vec::with_capacity(96);
+    let mut max_tree: Option<(String, u64)> = None;
 
     loop {
         header.clear();
@@ -686,24 +671,47 @@ fn batch_count_tree_entries(
         let Some(size) = parts.next().and_then(|s| s.parse::<usize>().ok()) else {
             continue;
         };
+        let oid = oid.to_string();
+        let kind = kind.to_string();
 
         let mut payload = vec![0u8; size];
         reader.read_exact(&mut payload)?;
         let mut trailing = [0u8; 1];
         let _ = reader.read_exact(&mut trailing);
 
-        if kind == "tree" {
-            // A tree entry is `<mode> <name>\0<raw-hash>`. The raw hash bytes can
-            // themselves contain 0x00, so counting NUL bytes would overcount; walk
-            // entries by skipping the hash (length derived from the oid hex width).
-            let hash_len = oid.len() / 2;
-            counts.insert(oid.to_string(), count_tree_entries(&payload, hash_len));
+        match kind.as_str() {
+            "tree" => {
+                // A tree entry is `<mode> <name>\0<raw-hash>`. The raw hash bytes
+                // can themselves contain 0x00, so counting NUL bytes would
+                // overcount; walk entries skipping the hash (width from oid hex).
+                let hash_len = oid.len() / 2;
+                let entries = count_tree_entries(&payload, hash_len);
+                result.total_tree_entries = result.total_tree_entries.saturating_add(entries);
+                if max_tree.as_ref().is_none_or(|(_, best)| entries > *best) {
+                    max_tree = Some((oid, entries));
+                }
+            }
+            "commit" => {
+                let parents = count_commit_parents(&payload);
+                if parents > result.max_parents {
+                    result.max_parents = parents;
+                }
+                if threshold_bytes > 0 {
+                    let length = commit_message_len(&payload);
+                    if length >= threshold_bytes {
+                        result
+                            .oversized_commit_messages
+                            .push(CommitMessageStat { oid, length });
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     writer
         .join()
-        .map_err(|_| io::Error::other("git cat-file tree writer thread panicked"))??;
+        .map_err(|_| io::Error::other("git cat-file batch writer thread panicked"))??;
     let status = child.wait()?;
     if !status.success() {
         return Err(io::Error::other(format!(
@@ -711,7 +719,41 @@ fn batch_count_tree_entries(
             status
         )));
     }
-    Ok(counts)
+
+    result.max_tree_entries = max_tree.map(|(oid, entries)| DirectoryStat {
+        path: oid,
+        entries: entries as usize,
+    });
+    // The batch pass visits objects in git's enumeration order; sort for a
+    // deterministic report (largest message first, then oid).
+    result
+        .oversized_commit_messages
+        .sort_by(|a, b| b.length.cmp(&a.length).then_with(|| a.oid.cmp(&b.oid)));
+    Ok(result)
+}
+
+/// Count `parent ` header lines in a raw commit object (the parent count, which
+/// matches `git rev-list --parents`). Header lines precede the first blank line.
+fn count_commit_parents(payload: &[u8]) -> usize {
+    let mut parents = 0;
+    for line in payload.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            break; // blank line terminates the header
+        }
+        if line.starts_with(b"parent ") {
+            parents += 1;
+        }
+    }
+    parents
+}
+
+/// Length in bytes of a raw commit object's message, i.e. everything after the
+/// first empty header line. Equivalent to the byte length of `%B`.
+fn commit_message_len(payload: &[u8]) -> usize {
+    match payload.windows(2).position(|w| w == b"\n\n") {
+        Some(pos) => payload.len() - (pos + 2),
+        None => 0,
+    }
 }
 
 /// Count the entries in a raw git tree payload. Each entry is
@@ -869,102 +911,6 @@ fn gather_refs(repo: &Path, metrics: &mut RepositoryMetrics) -> io::Result<()> {
     }
     Ok(())
 }
-
-fn gather_max_parents(repo: &Path) -> io::Result<usize> {
-    let (mut reader, mut child) =
-        run_git_capture_stream(repo, &["rev-list", "--parents", "--all"])?;
-    let mut max_parents: usize = 0;
-    let mut line = String::new();
-    while reader.read_line(&mut line)? > 0 {
-        let count = line.split_whitespace().count();
-        if count > 0 {
-            let parents = count - 1; // first is commit itself
-            if parents > max_parents {
-                max_parents = parents;
-            }
-        }
-        line.clear();
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "git rev-list --parents --all failed: {}",
-            status
-        )));
-    }
-
-    Ok(max_parents)
-}
-
-fn gather_oversized_commit_messages(
-    repo: &Path,
-    threshold_bytes: usize,
-) -> io::Result<Vec<CommitMessageStat>> {
-    if threshold_bytes == 0 {
-        return Ok(Vec::new());
-    }
-    let (mut reader, mut child) =
-        run_git_capture_stream(repo, &["log", "--all", "--pretty=%H%x00%B%x00"])?;
-    let stats = collect_oversized_commit_messages_from_reader(&mut reader, threshold_bytes)?;
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "git log --all --pretty=%H%x00%B%x00 failed: {}",
-            status
-        )));
-    }
-
-    Ok(stats)
-}
-
-fn collect_oversized_commit_messages_from_reader<R: BufRead>(
-    reader: &mut R,
-    threshold_bytes: usize,
-) -> io::Result<Vec<CommitMessageStat>> {
-    if threshold_bytes == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut stats = Vec::new();
-    let mut oid_buf = Vec::new();
-    let mut msg_buf = Vec::new();
-
-    loop {
-        oid_buf.clear();
-        let oid_read = reader.read_until(0, &mut oid_buf)?;
-        if oid_read == 0 {
-            break;
-        }
-        if oid_buf.last() == Some(&0) {
-            oid_buf.pop();
-        }
-        if oid_buf.is_empty() {
-            break;
-        }
-
-        msg_buf.clear();
-        let msg_read = reader.read_until(0, &mut msg_buf)?;
-        if msg_read == 0 {
-            break;
-        }
-        if msg_buf.last() == Some(&0) {
-            msg_buf.pop();
-        }
-
-        if msg_buf.len() >= threshold_bytes {
-            stats.push(CommitMessageStat {
-                oid: String::from_utf8_lossy(&oid_buf).trim().to_string(),
-                length: msg_buf.len(),
-            });
-        }
-    }
-
-    Ok(stats)
-}
-
-// (removed old gather_history_stats; superseded by gather_history_fast_export)
 
 fn evaluate_warnings(metrics: &RepositoryMetrics, thresholds: &AnalyzeThresholds) -> Vec<Warning> {
     let mut warnings = Vec::new();
@@ -1726,8 +1672,8 @@ fn concern_for_warn_crit_u64(value: u64, warn: u64, critical: u64) -> Concern {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_blob_sizes_from_reader, collect_oversized_commit_messages_from_reader,
-        color_output_enabled, count_tree_entries, flush_progress_writer, format_bytes,
+        collect_blob_sizes_from_reader, color_output_enabled, commit_message_len,
+        count_commit_parents, count_tree_entries, flush_progress_writer, format_bytes,
     };
     use std::io::{Cursor, ErrorKind, Write};
 
@@ -1876,37 +1822,41 @@ ffffffffffffffffffffffffffffffffffffffff blob 12 6
         assert!(!color_output_enabled(false, true, true));
     }
 
+    fn commit_object(parents: usize, message: &str) -> Vec<u8> {
+        let mut obj = Vec::new();
+        obj.extend_from_slice(b"tree 1111111111111111111111111111111111111111\n");
+        for _ in 0..parents {
+            obj.extend_from_slice(b"parent 2222222222222222222222222222222222222222\n");
+        }
+        obj.extend_from_slice(b"author A <a@example.com> 0 +0000\n");
+        obj.extend_from_slice(b"committer C <c@example.com> 0 +0000\n");
+        obj.push(b'\n');
+        obj.extend_from_slice(message.as_bytes());
+        obj
+    }
+
     #[test]
-    fn collect_oversized_commit_messages_from_reader_filters_by_threshold() {
-        let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0short\0\
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0this message is long enough\0";
-        let mut reader = Cursor::new(&input[..]);
-
-        let stats =
-            collect_oversized_commit_messages_from_reader(&mut reader, 10).expect("parse stream");
-
-        assert_eq!(stats.len(), 1, "expected only one message above threshold");
+    fn count_commit_parents_counts_only_header_parent_lines() {
+        assert_eq!(count_commit_parents(&commit_object(0, "msg\n")), 0);
+        assert_eq!(count_commit_parents(&commit_object(1, "msg\n")), 1);
+        // A "parent " occurrence inside the message must not be counted.
         assert_eq!(
-            stats[0].oid, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "expected longer message oid to be captured"
-        );
-        assert!(
-            stats[0].length >= 10,
-            "expected captured message length >= threshold"
+            count_commit_parents(&commit_object(2, "parent of all\nbody\n")),
+            2
         );
     }
 
     #[test]
-    fn collect_oversized_commit_messages_from_reader_ignores_truncated_pairs() {
-        let input = b"cccccccccccccccccccccccccccccccccccccccc\0";
-        let mut reader = Cursor::new(&input[..]);
-
-        let stats =
-            collect_oversized_commit_messages_from_reader(&mut reader, 1).expect("parse stream");
-
-        assert!(
-            stats.is_empty(),
-            "truncated oid/message pair should be ignored without panic"
-        );
+    fn commit_message_len_matches_bytes_after_header_separator() {
+        // Single-line message keeps its trailing newline (matching %B).
+        assert_eq!(commit_message_len(&commit_object(0, "hello\n")), 6);
+        // Multi-paragraph message: the internal blank line is part of the body.
+        let msg = "subject\n\nbody\n";
+        assert_eq!(commit_message_len(&commit_object(1, msg)), msg.len());
+        // Non-ASCII bytes are counted by byte length, not chars.
+        let utf8 = "日本語\n";
+        assert_eq!(commit_message_len(&commit_object(0, utf8)), utf8.len());
+        // Empty message => zero length.
+        assert_eq!(commit_message_len(&commit_object(0, "")), 0);
     }
 }

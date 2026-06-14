@@ -286,6 +286,169 @@ fn analyze_mode_warns_on_commit_thresholds() {
     );
 }
 
+/// Raw stdout bytes from a git command (so byte lengths and embedded NULs are
+/// preserved exactly, unlike the lossy String helper).
+fn git_raw_stdout(repo: &Path, args: &[&str]) -> Vec<u8> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Reproduce the legacy oversized-commit-message measurement exactly:
+/// `git log --all --pretty=%H%x00%B%x00`, split on NUL, trim the oid, and keep
+/// messages whose byte length is >= threshold. Returns a sorted (oid8, len) set.
+fn expected_oversized(repo: &Path, threshold: usize) -> Vec<(String, usize)> {
+    let raw = git_raw_stdout(repo, &["log", "--all", "--pretty=%H%x00%B%x00"]);
+    let mut parts = raw.split(|&b| b == 0);
+    let mut out = Vec::new();
+    loop {
+        let Some(oid_bytes) = parts.next() else { break };
+        let oid = String::from_utf8_lossy(oid_bytes).trim().to_string();
+        if oid.is_empty() {
+            break;
+        }
+        let Some(msg_bytes) = parts.next() else { break };
+        if msg_bytes.len() >= threshold {
+            out.push((oid[..oid.len().min(8)].to_string(), msg_bytes.len()));
+        }
+    }
+    out.sort();
+    out
+}
+
+fn expected_max_parents(repo: &Path) -> usize {
+    let raw = git_raw_stdout(repo, &["rev-list", "--parents", "--all"]);
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .map(|line| line.split_whitespace().count().saturating_sub(1))
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn analyze_history_metrics_match_legacy_git_measurements() {
+    // p2-analyze-batch-merge parity gate: the single cat-file --batch pass that
+    // derives max parents and oversized commit messages must match the legacy
+    // `git rev-list --parents --all` / `git log --all --pretty=%B` results
+    // byte-for-byte across tricky commit shapes.
+    let repo = init_repo();
+    let base_branch = {
+        let (_, b, _) = run_git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        let b = b.trim().to_string();
+        if b.is_empty() || b == "HEAD" {
+            "master".to_string()
+        } else {
+            b
+        }
+    };
+
+    // multi-paragraph + trailing newline
+    write_file(&repo, "a.txt", "a\n");
+    assert_eq!(run_git(&repo, &["add", "."]).0, 0);
+    assert_eq!(
+        run_git(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "subject line",
+                "-m",
+                "second paragraph body"
+            ]
+        )
+        .0,
+        0
+    );
+
+    // non-ASCII message
+    write_file(&repo, "b.txt", "b\n");
+    assert_eq!(run_git(&repo, &["add", "."]).0, 0);
+    assert_eq!(
+        run_git(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "日本語のコミットメッセージ with mixed ascii"
+            ]
+        )
+        .0,
+        0
+    );
+
+    // diverging branch + merge commit (2 parents)
+    assert_eq!(run_git(&repo, &["checkout", "-b", "feature"]).0, 0);
+    write_file(&repo, "c.txt", "c\n");
+    assert_eq!(run_git(&repo, &["add", "."]).0, 0);
+    assert_eq!(run_git(&repo, &["commit", "-m", "feature work"]).0, 0);
+    assert_eq!(run_git(&repo, &["checkout", &base_branch]).0, 0);
+    write_file(&repo, "d.txt", "d\n");
+    assert_eq!(run_git(&repo, &["add", "."]).0, 0);
+    assert_eq!(run_git(&repo, &["commit", "-m", "mainline work"]).0, 0);
+    assert_eq!(
+        run_git(
+            &repo,
+            &[
+                "merge",
+                "feature",
+                "--no-ff",
+                "-m",
+                "Merge feature with a deliberately long explanation paragraph",
+            ],
+        )
+        .0,
+        0
+    );
+
+    // annotated tag => a tag object in the reachable set (must be ignored by the
+    // commit/tree pass, not misparsed as a commit).
+    assert_eq!(
+        run_git(&repo, &["tag", "-a", "v1", "-m", "annotated tag message"]).0,
+        0
+    );
+
+    for threshold in [1usize, 20, 41] {
+        let mut opts = fr::Options {
+            source: repo.clone(),
+            target: repo.clone(),
+            mode: fr::Mode::Analyze,
+            force: true,
+            ..Default::default()
+        };
+        opts.analyze.thresholds.warn_commit_msg_bytes = threshold;
+        let report = fr::analysis::generate_report(&opts).expect("generate analysis report");
+
+        assert_eq!(
+            report.metrics.max_commit_parents,
+            expected_max_parents(&repo),
+            "max_commit_parents must match git rev-list --parents"
+        );
+
+        let mut got: Vec<(String, usize)> = report
+            .metrics
+            .oversized_commit_messages
+            .iter()
+            .map(|m| (m.oid[..m.oid.len().min(8)].to_string(), m.length))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            expected_oversized(&repo, threshold),
+            "oversized commit messages must match legacy %B measurement at threshold {threshold}"
+        );
+    }
+}
+
 #[test]
 fn analyze_subflags_imply_read_only_analyze_mode() {
     // `--analyze-top` is an analyze-only option. Used without an explicit
