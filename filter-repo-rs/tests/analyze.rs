@@ -311,8 +311,7 @@ fn expected_oversized(repo: &Path, threshold: usize) -> Vec<(String, usize)> {
     let raw = git_raw_stdout(repo, &["log", "--all", "--pretty=%H%x00%B%x00"]);
     let mut parts = raw.split(|&b| b == 0);
     let mut out = Vec::new();
-    loop {
-        let Some(oid_bytes) = parts.next() else { break };
+    while let Some(oid_bytes) = parts.next() {
         let oid = String::from_utf8_lossy(oid_bytes).trim().to_string();
         if oid.is_empty() {
             break;
