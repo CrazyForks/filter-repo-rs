@@ -236,6 +236,10 @@ pub fn finalize(
         }
     }
 
+    // Reuses the pre-update ref snapshot to derive the post-update ref set for
+    // HEAD finalization, avoiding a second `for-each-ref` scan when the updates
+    // all applied. None => fall back to a fresh query (dry-run or update failure).
+    let mut refs_after_cache: Option<HashMap<String, String>> = None;
     if !opts.dry_run {
         let mut resolved_updates: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (refname, target) in branch_reset_targets.drain(..) {
@@ -244,6 +248,7 @@ pub fn finalize(
             }
         }
         let mut update_payload: Vec<u8> = Vec::new();
+        let mut deleted_ref_names: Vec<String> = Vec::new();
         let repo_refs_before = gitutil::get_all_refs(&opts.target)?;
         for (refname, oid) in &resolved_updates {
             let ref_str = String::from_utf8_lossy(refname);
@@ -270,6 +275,7 @@ pub fn finalize(
                 update_payload.extend_from_slice(b"delete ");
                 update_payload.extend_from_slice(old);
                 update_payload.push(b'\n');
+                deleted_ref_names.push(old_ref.clone());
             } else if let Some(refname) = resolved_name {
                 eprintln!(
                     "warning: not deleting {} because repository resolves to {}",
@@ -282,6 +288,7 @@ pub fn finalize(
                 );
             }
         }
+        let mut ref_update_ok = true;
         if !update_payload.is_empty() {
             let mut child = Command::new("git")
                 .arg("-C")
@@ -297,12 +304,23 @@ pub fn finalize(
             }
             let status = child.wait()?;
             if !status.success() {
+                ref_update_ok = false;
                 eprintln!(
                     "warning: {} failed: {}",
                     "git update-ref".cyan().bold(),
                     status
                 );
             }
+        }
+        // When every update/delete applied, the post-update ref set is exactly
+        // before + updated - deleted, so HEAD finalization can skip a second
+        // for-each-ref scan. On any failure we leave the cache empty and re-query.
+        if ref_update_ok {
+            refs_after_cache = Some(derive_refs_after(
+                &repo_refs_before,
+                &resolved_updates,
+                &deleted_ref_names,
+            ));
         }
     }
 
@@ -579,7 +597,10 @@ pub fn finalize(
         .stderr(Stdio::null())
         .output()?;
     if !opts.dry_run {
-        let repo_refs_after = gitutil::get_all_refs(&opts.target)?;
+        let repo_refs_after = match refs_after_cache {
+            Some(after) => after,
+            None => gitutil::get_all_refs(&opts.target)?,
+        };
         if head_ref.status.success() {
             let head = String::from_utf8_lossy(&head_ref.stdout).trim().to_string();
             if !repo_refs_after.contains_key(&head) {
@@ -776,10 +797,86 @@ fn resolve_reset_target(
     Ok(None)
 }
 
+/// Derive the post-update ref set from the pre-update snapshot plus the applied
+/// updates and deletes. This mirrors what a fresh `git for-each-ref` would
+/// report after a successful `git update-ref --stdin`, letting HEAD
+/// finalization avoid a second full ref scan. Updates insert/overwrite a ref;
+/// deletes remove it (applied after updates, matching update-ref's in-order
+/// processing where an update + delete of the same ref nets to deleted).
+fn derive_refs_after(
+    before: &HashMap<String, String>,
+    updates: &BTreeMap<Vec<u8>, Vec<u8>>,
+    deleted: &[String],
+) -> HashMap<String, String> {
+    let mut after = before.clone();
+    for (refname, oid) in updates {
+        after.insert(
+            String::from_utf8_lossy(refname).into_owned(),
+            String::from_utf8_lossy(oid).into_owned(),
+        );
+    }
+    for name in deleted {
+        after.remove(name);
+    }
+    after
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn refs_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn derive_refs_after_applies_updates_and_deletes() {
+        let before = refs_map(&[
+            ("refs/heads/main", "aaa"),
+            ("refs/heads/old", "bbb"),
+            ("refs/tags/v1", "ccc"),
+        ]);
+        let mut updates: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        updates.insert(b"refs/heads/main".to_vec(), b"ddd".to_vec()); // overwrite
+        updates.insert(b"refs/heads/new".to_vec(), b"eee".to_vec()); // insert
+        let deleted = vec!["refs/heads/old".to_string()];
+
+        let after = derive_refs_after(&before, &updates, &deleted);
+
+        assert_eq!(
+            after.get("refs/heads/main").map(String::as_str),
+            Some("ddd")
+        );
+        assert_eq!(after.get("refs/heads/new").map(String::as_str), Some("eee"));
+        assert_eq!(after.get("refs/tags/v1").map(String::as_str), Some("ccc"));
+        assert!(!after.contains_key("refs/heads/old"));
+        assert_eq!(after.len(), 3);
+    }
+
+    #[test]
+    fn derive_refs_after_update_then_delete_same_ref_nets_to_deleted() {
+        // update-ref processes updates before deletes; deletes win.
+        let before = refs_map(&[("refs/heads/x", "aaa")]);
+        let mut updates: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        updates.insert(b"refs/heads/x".to_vec(), b"bbb".to_vec());
+        let deleted = vec!["refs/heads/x".to_string()];
+
+        let after = derive_refs_after(&before, &updates, &deleted);
+
+        assert!(!after.contains_key("refs/heads/x"));
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn derive_refs_after_no_changes_equals_before() {
+        let before = refs_map(&[("refs/heads/main", "aaa")]);
+        let after = derive_refs_after(&before, &BTreeMap::new(), &[]);
+        assert_eq!(after, before);
+    }
 
     struct BrokenPipeWriter;
 
