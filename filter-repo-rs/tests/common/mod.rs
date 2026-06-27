@@ -177,7 +177,9 @@ fn main() {
         fields.push(arg.to_string_lossy().into_owned());
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        let _ = writeln!(file, "{}", fields.join("\t"));
+        let mut line = fields.join("\t").into_bytes();
+        line.push(b'\n');
+        let _ = file.write_all(&line);
     }
     let status = Command::new(real_git).args(&args).status();
     match status {
