@@ -412,10 +412,23 @@ pub fn handle_file_change_line(
 mod tests {
     use super::*;
 
+    // Passthrough is intentionally disabled on Windows (paths always require
+    // sanitization), so this acceptance case only holds on other platforms.
+    #[cfg(not(windows))]
     #[test]
     fn passthrough_accepts_simple_modify_when_no_path_rules() {
         let opts = Options::default();
         assert!(can_passthrough_file_change_line(
+            b"M 100644 :42 src/main.rs\n",
+            &opts
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn passthrough_disabled_on_windows_even_without_path_rules() {
+        let opts = Options::default();
+        assert!(!can_passthrough_file_change_line(
             b"M 100644 :42 src/main.rs\n",
             &opts
         ));
