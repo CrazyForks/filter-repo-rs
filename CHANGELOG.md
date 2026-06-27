@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-06-28
+
+### 🚀 Features
+
+- *(analyze)* Unify reachable measurement model and adaptive output
+
+### 🐛 Bug Fixes
+
+- *(process)* Avoid panic on retry exhaustion and stabilize large-output timeout tests
+- *(opts)* Treat analyze-only flags as read-only analyze mode
+
+### 🚜 Refactor
+
+- *(stream)* Extract dual_write for blob payload writes
+
+### ⚡ Performance
+
+- *(stream)* Borrow unchanged commit identity lines
+- *(message)* Skip replacement pass on clean payloads
+- *(filechange)* Fast-path plain passthrough lines
+- *(detect)* Prefilter default secret patterns
+- *(stream)* Avoid cloning blob parser state per header line
+- *(stream)* Reuse resolved target git dir for fast-import
+- *(analyze)* Fold commit/tree history metrics into one cat-file pass
+- *(finalize)* Derive post-update ref set instead of a second for-each-ref
+
+### 🎨 Styling
+
+- *(test)* Use while-let in analyze oversized parser
+
+### 🧪 Testing
+
+- *(alloc)* Add deterministic allocation-count probe
+- *(filechange)* Cover windows passthrough gating
+
 ## [1.0.3] - 2026-04-18
 
 ### 🚀 Features
